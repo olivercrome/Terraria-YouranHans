@@ -2742,6 +2742,8 @@ public class MainActivity extends Activity {
             none.setTextColor(Skin.mutedText(this));
             outer.addView(none);
         }
+        // 历史对话框引用(供长按条目弹去旧后关掉本窗)
+        final android.app.AlertDialog[] histDlg = {null};
         // 二级文件名
         for (java.util.Map.Entry<String, List<HistoryLog.Entry>> f : byFile.entrySet()) {
             TextView fileHead = new TextView(this);
@@ -2765,11 +2767,19 @@ public class MainActivity extends Activity {
                 // 上层=小圆角卡
                 LinearLayout innerUpper = UiKit.roundedList(MainActivity.this,0xFFEFEFEF, up.getKey());
                 for (HistoryLog.Entry e : up.getValue()) {
+                    final HistoryLog.Entry ent = e;
                     LinearLayout keyCard = UiKit.roundedList(MainActivity.this,0xFFE6EFFF, "");
                     // 每 key：两段(旧红划线 / 新绿)
                     keyCard.addView(UiKit.labelLine(MainActivity.this,"key", e.key, 0xFF222222, false));
                     keyCard.addView(UiKit.labelLine(MainActivity.this,"旧", e.old_, 0xFFC0392B, true));
                     keyCard.addView(UiKit.labelLine(MainActivity.this,"新", e.now, 0xFF1E8449, false));
+                    final LinearLayout cardRow = keyCard;
+                    // 长按该条记录→ 直接带你去当前 json 里那条 key(优先现在的名字，找不到则去根)
+                    cardRow.setOnLongClickListener(v -> {
+                        if (histDlg[0] != null) { try { histDlg[0].dismiss(); } catch (Exception ignored) {} }
+                        jumpByHistory(ent);
+                        return true;
+                    });
                     innerUpper.addView(keyCard);
                 }
                 outer.addView(UiKit.outerAdded(MainActivity.this,innerUpper));
@@ -2784,6 +2794,7 @@ public class MainActivity extends Activity {
                 .setView(sv)
                 .setPositiveButton("完成", (dl, w) -> dl.dismiss())
                 .create();
+        histDlg[0] = d;   // 让长按“带到现场”的监听能先把本窗关掉
         d.setOnShowListener(ds -> styleDialogDark(d));
         d.show();
         styleDialogDark(d);
@@ -2795,6 +2806,57 @@ public class MainActivity extends Activity {
 
     private void savePrefBool(String k, boolean v) {
         getSharedPreferences("youran_ui", MODE_PRIVATE).edit().putBoolean(k, v).apply();
+    }
+
+    /** 历史条目“长按直达”：尽力静默保存当前未存改动(失败则停并提示)，
+     *  然后按记录的文件打开并跳到该 key 现在的容器层高亮。优先用当前 key 名重新定位，
+     *  key 同名已不存在时退回文件根。 */
+    private void jumpByHistory(HistoryLog.Entry ent) {
+        if (ent == null) return;
+        if (tree != null && openName != null && tree.isDirty()) {
+            doSave();
+            if (tree != null && tree.isDirty()) { toast("有条目保存失败"); return; }
+        }
+        if (currentBranch == null) { toast("请先选一个分支"); return; }
+        List<String> avail;
+        try { avail = listJsonFor(currentBranch); } catch (Exception e) { toast("找不到文件：" + e.getMessage()); return; }
+        String exact = null;
+        for (String n : avail) {
+            if (n.equals(ent.file) || n.equals(ent.file + ".json")) { exact = n; break; }
+        }
+        if (exact == null) { toast("该 json 不在当前侧边分支，请先切过去再长按"); return; }
+        openFile(currentBranch, exact);          // 打开后 tree 就是目标 json
+        if (tree == null) return;
+        List<String> segs = locateKeySegs(tree.rootObject(), ent.key, new ArrayList<String>());
+        path.clear();
+        if (segs != null) path.addAll(segs);
+        hlFile = exact;
+        hlSegs = segs != null ? new ArrayList<String>(segs) : new ArrayList<String>();
+        hlKey = ent.key;
+        renderContainer();
+        if (segs != null && segs.isEmpty()) toast("已到该条(文件根就含此 key)");
+        else if (segs != null) toast("已到 \"" + ent.key + "\" 所在条目");
+        else toast("该 key 在当前版本下找不到了，已到文件根");
+    }
+
+    /** 深度遍历 obj，定位“能把 key 作为直接子键”的那个容器，换算成容器路径 segs。
+     *  找不到(null 传回)、根就含 key(空列表→成立)。 */
+    private List<String> locateKeySegs(JSONObject obj, String key, List<String> here) {
+        if (obj == null) return null;
+        if (obj.has(key)) return new ArrayList<String>(here);
+        java.util.Iterator<String> it = obj.keys();
+        while (it.hasNext()) {
+            String childName = it.next();
+            try {
+                JSONObject c = obj.optJSONObject(childName);
+                if (c == null) continue;
+                List<String> sub = new ArrayList<String>(here);
+                sub.add(childName);
+                List<String> r = locateKeySegs(c, key, sub);
+                if (r != null) return r;
+            } catch (Exception ignored) { }
+        }
+        return null;
     }
 
     /** 仅收起软键盘(不关页面)。 */
@@ -3027,11 +3089,28 @@ public class MainActivity extends Activity {
         }, 260);
     }
 
-    /** 跳转：切到命中 key 所在容器层，标亮并滚到那一行；若非顶层给约 2 秒的“文件-条目”提示。 */
+    /** 搜索跳转护栏：跳到“同一个仓库的另一个 json”的 key 时不做确认，
+     *  只是尽力静默保存当前修改(成功才跳；失败不跳并以 toast 明示)。仍同文件时直达不打扰。 */
     private void jumpTo(List<String> containerSegs, String key, Branch br, String file) {
         if (br == null) return;
         boolean switchedFile = (tree == null || openName == null || !openName.equals(file));
-        if (switchedFile) openFile(br, file);   // 置 tree/openName(顶层) 
+        if (!switchedFile || tree == null || !tree.isDirty()) {
+            doJumpTo(containerSegs, key, br, file);
+            return;
+        }
+        doSave();                                  // 静默尽力保存当前改动
+        if (tree != null && tree.isDirty()) {      // 仍脏说明这次没保存成功
+            toast("有条目保存失败");
+            return;
+        }
+        doJumpTo(containerSegs, key, br, file);
+    }
+
+    /** 实际执行：切到命中 key 所在容器层，标亮并滚到那一行；若非顶层给约 2 秒“文件-条目”提示。 */
+    private void doJumpTo(List<String> containerSegs, String key, Branch br, String file) {
+        if (br == null) return;
+        boolean switchedFile = (tree == null || openName == null || !openName.equals(file));
+        if (switchedFile) openFile(br, file);   // 置 tree/openName(顶层)
         if (tree == null) return;
         List<String> target = new ArrayList<>();
         if (containerSegs != null) target.addAll(containerSegs);
