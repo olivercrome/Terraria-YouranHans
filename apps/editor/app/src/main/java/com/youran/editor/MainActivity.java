@@ -88,6 +88,29 @@ public class MainActivity extends Activity {
 
     // 抽屉分支 置顶集合(按插入序)。重入不清?仅存会话,后续可落盘。
     final java.util.LinkedHashSet<String> pinnedBranchIds = new java.util.LinkedHashSet<>();
+    private static final String PREFS_PIN = "youran_prefs";
+    private static final String KEY_PINNED = "pinned_branch_ids";
+    private boolean pinnedRestored = false;
+
+    /** 启动首次重建抽屉前，把上次记住的顶置分支 id 恢复进 pinnedBranchIds(仅一次)。 */
+    private void restorePinnedIfNeeded() {
+        if (pinnedRestored) return;
+        pinnedRestored = true;
+        try {
+            String v = getSharedPreferences(PREFS_PIN, MODE_PRIVATE).getString(KEY_PINNED, "[]");
+            org.json.JSONArray arr = new org.json.JSONArray(v);
+            for (int i = 0; i < arr.length(); i++) pinnedBranchIds.add(arr.getString(i));
+        } catch (Exception ignored) { }
+    }
+
+    /** 顶置 id 集合有变化即落盘(重进保持)。 */
+    private void persistPinned() {
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (String id : pinnedBranchIds) arr.put(id);
+            getSharedPreferences(PREFS_PIN, MODE_PRIVATE).edit().putString(KEY_PINNED, arr.toString()).apply();
+        } catch (Exception ignored) { }
+    }
 
     // 当前 json 内正处于的那一层容器“父链”(渲染该层列表前由进入处登记)，供内部行“是否已收藏”判断用
     List<String> curSelfSegs = new ArrayList<>();
@@ -210,6 +233,7 @@ public class MainActivity extends Activity {
     /** 首屏引导：居中的圆角空态卡(A：精致空态)。 */
     /** 重建抽屉数据并重画(新建分支后调用)。 */
     private void refreshDrawerList() {
+        restorePinnedIfNeeded();               // 首次重建前把上次置顶集合读回来(持久)
         java.util.List<Branch> all = repos.all();
         java.util.List<Branch> top = new ArrayList<>();
         for (String id : pinnedBranchIds) { Branch b = repos.byId(id); if (b != null) top.add(b); }
@@ -372,6 +396,7 @@ public class MainActivity extends Activity {
     private void toggleBranchPin(String id) {
         if (pinnedBranchIds.contains(id)) pinnedBranchIds.remove(id);
         else pinnedBranchIds.add(id);
+        persistPinned();                 // 顶置变化即刻落盘：重进/刷新都保持置顶
         refreshDrawerList();
     }
 
@@ -1388,8 +1413,8 @@ public class MainActivity extends Activity {
     }
 
     private void refreshBranchList() {
-        currentBranchList = repos.all();
-        drawerList.setAdapter(new BranchAdapter(currentBranchList));
+        // 用与置顶一致的排序重建（顶置分支排最前）；绝不能用 repos.all() 把“顶置”顺位挤掉
+        refreshDrawerList();
     }
 
     /** 抽屉里点某分支：若未绑定 SAF 先绑定，否则列其 json 文件。 */
