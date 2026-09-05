@@ -108,10 +108,14 @@ public class MainActivity extends Activity {
 
     private File rootDir;                  // 本地草稿库根(getExternalFilesDir) — 用于无 SAF 时跑通流程
 
+    // 分支“导出”回调期对象：在 SAF 确认导出位置后才真正收集该分支 json
+    private Branch branchForExport;
+
     private static final int REQ_PICK_DIR = 1001;
     private static final int REQ_PICK_BG   = 1002;   // 设置里选背景图
     private static final int REQ_IMPORT_FOLDER = 1003;  // 导入文件夹(批量拷 json 入当前草稿分支)
     private static final int REQ_IMPORT_JSF  = 1004;   // 自选 json(可多选) 拷入当前草稿分支
+    private static final int REQ_EXPORT_ZIP = 1005;   // 分支导出 zip：选保存位置
 
     @Override
     protected void onCreate(Bundle b) {
@@ -343,6 +347,12 @@ public class MainActivity extends Activity {
         bRow.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
         bRow.addView(bDel, new LinearLayout.LayoutParams(0, dp(42), 1f));
         col.addView(bRow, new LinearLayout.LayoutParams(-1, dp(46)));
+        // “导出”整行：把该分支的 json 压成 zip(&lt;分支名&gt;.zip)，取 SAF 保存位置
+        LinearLayout.LayoutParams exlp = new LinearLayout.LayoutParams(-1, dp(44));
+        exlp.topMargin = dp(8);
+        TextView bExp = UiKit.chipBtn(MainActivity.this, "⬇ 导出分支(zip)", 0xFF557A46);
+        bExp.setOnClickListener(v -> { h[0].dismiss(); startExportBranch(br); });
+        col.addView(bExp, exlp);
 
         AlertDialog d = new AlertDialog.Builder(this)
                 .setCustomTitle(hdr)              // 标题自定义行:左分支名 + 右贴边置顶箭头
@@ -1635,6 +1645,76 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 分支长按菜单“导出”：ACTION_CREATE_DOCUMENT 让用户给 zip 取名+选保存位置。 */
+    private void startExportBranch(final Branch br) {
+        branchForExport = br;
+        try {
+            Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("application/zip");
+            i.putExtra(Intent.EXTRA_TITLE, exportZipBaseName(br) + ".zip");
+            startActivityForResult(i, REQ_EXPORT_ZIP);
+        } catch (Exception e) {
+            toast("导出: " + e.getMessage());
+        }
+    }
+
+    /** zip 默认文件名 = 分支名（去除路径类不合法字符）。 */
+    private String exportZipBaseName(Branch br) {
+        String n = (br.title == null || br.title.trim().isEmpty()) ? br.getJsonDirName() : br.title.trim();
+        return n.replaceAll("[\\\\/:*?\"<>|]", "_");
+    }
+
+    /** 读取草稿库本地某 json（文件不存在/读失败返回 null）。 */
+    private String readLocalJson(File root, String dir, String name) {
+        try {
+            File f = new File(new File(root, dir), name);
+            byte[] b = new byte[(int) f.length()];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            int off = 0, r;
+            while (off < b.length && (r = in.read(b, off, b.length - off)) >= 0) off += r;
+            in.close();
+            return new String(b, 0, off, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 把一个分支的全部 .json(草稿/SAF) 压成 zip 内存字节；无 json 返回 null。 */
+    private byte[] branchZipBytes(Branch br) throws Exception {
+        boolean isSaf = br != null && br.hasSaf();
+        java.util.List<String> names = new java.util.ArrayList<>();
+        if (isSaf) {
+            java.util.List<String> hs = SafDir.listJson(this, br.safUri);
+            if (hs != null) names.addAll(hs);
+        } else {
+            File d = new File(rootDir, br.getJsonDirName());
+            if (d.exists()) {
+                File[] all = d.listFiles();
+                if (all != null) {
+                    for (File f : all) {
+                        if (f.isFile() && f.getName().toLowerCase(java.util.Locale.US).endsWith(".json"))
+                            names.add(f.getName());
+                    }
+                }
+            }
+        }
+        java.util.Collections.sort(names);
+        if (names.isEmpty()) return null;
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        java.util.zip.ZipOutputStream zout = new java.util.zip.ZipOutputStream(bos);
+        for (String name : names) {
+            String text = isSaf ? SafDir.readFile(this, br.safUri, name) : readLocalJson(rootDir, br.getJsonDirName(), name);
+            if (text == null) continue;
+            zout.putNextEntry(new java.util.zip.ZipEntry(name));
+            zout.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            zout.closeEntry();
+        }
+        zout.finish();
+        zout.close();
+        return bos.toByteArray();
+    }
+
     private void startSafPick() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         startActivityForResult(i, REQ_PICK_DIR);
@@ -1709,6 +1789,24 @@ public class MainActivity extends Activity {
                     ? ("导入 " + okN + " 个 json" + (sk > 0 ? ("，跳过 " + sk) : ""))
                     : "没有选择任何文件");
             onBranchSelected(currentBranch);
+        } else if (req == REQ_EXPORT_ZIP && res == RESULT_OK && data != null && data.getData() != null) {
+            // 分支导出：在拿到目标位置后按“分支名.zip”把 json 打包写入
+            Uri out = data.getData();
+            Branch eb = branchForExport;
+            branchForExport = null;
+            if (eb == null) return;
+            try {
+                byte[] bytes = branchZipBytes(eb);
+                if (bytes == null) { toast("该分支还没有可导出的 json"); return; }
+                java.io.OutputStream os = getContentResolver().openOutputStream(out);
+                if (os == null) throw new java.io.IOException("无法写目标文件");
+                os.write(bytes);
+                os.flush();
+                os.close();
+                toast("导出完成 ✔");
+            } catch (Exception e) {
+                toast("导出失败: " + e.getMessage());
+            }
         }
     }
 
