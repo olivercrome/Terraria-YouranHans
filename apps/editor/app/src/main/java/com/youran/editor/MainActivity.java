@@ -2820,8 +2820,20 @@ public class MainActivity extends Activity {
 
         // 执行搜索(点回车/输入实时可，这里回车触发)
         final java.util.function.Consumer<Void> run = (x) -> {
-            String needle = input.getText().toString().trim();
-            if (needle.isEmpty()) { status.setText("输入要搜的 key 或文本"); return; }
+            final String raw = input.getText().toString().trim();
+            // 搜索增强：支持 “父-子” 两段。
+            //   含 “-”：最后一个 “-” 之前 = “父层约束”；之后 = 要搜的子项(key/值片段)。
+            //   只有一个连字符长单词仍然照旧整体弱搜，不被误拆。
+            int dash = raw.lastIndexOf('-');
+            final boolean dsplit = dash > 0 && dash < raw.length() - 1;
+            final String par = dsplit ? raw.substring(0, dash).trim() : "";
+            final String term = dsplit ? raw.substring(dash + 1).trim() : raw;
+            if (term.isEmpty() || (dsplit && par.isEmpty())) {
+                status.setText(dsplit ? "连字符前后都得有内容: 例 “上层-子项”"
+                                       : "输入要搜的 key 或文本");
+                return;
+            }
+            final String needle = term;   // 匿名 adapter 需要 effectively final；term 已不再重赋值
             final List<Hit> hits = new ArrayList<>();
             final boolean ci = true;
             // 生成 scope 目标文件名集合：明确>模糊
@@ -2850,8 +2862,26 @@ public class MainActivity extends Activity {
                     collectHits(root, new ArrayList<String>(), fn, needle, ci, hits);
                 } catch (Exception ignore) { }
             }
+            // 搜索增强·父段过滤：仅保留“该命中有一个祖先对象名 / 其文件名包含父段”的那些行。
+            if (!par.isEmpty()) {
+                java.util.List<Hit> kept = new java.util.ArrayList<>();
+                for (Hit h : hits) {
+                    boolean ok = false;
+                    if (h.file != null && contains(ci, h.file, par)) ok = true;
+                    if (!ok && h.upper != null) {
+                        for (String s : h.upper) {
+                            if (contains(ci, s, par)) { ok = true; break; }
+                        }
+                    }
+                    if (ok) kept.add(h);
+                }
+                hits.clear();
+                hits.addAll(kept);
+            }
             if (hits.isEmpty()) {
-                status.setText("没有找到包含 “" + needle + "” 的条目");
+                status.setText(par.isEmpty()
+                        ? "没有找到包含 “" + needle + "” 的条目"
+                        : "没有找到含父段 “" + par + "”、子项 “" + needle + "” 的条目");
                 results.setAdapter(null);
                 results.setVisibility(View.GONE);
                 return;
