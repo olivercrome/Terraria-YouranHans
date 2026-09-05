@@ -1,0 +1,33 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.youran.editor'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.youran.editor"
+        minSdk 26
+        targetSdk 34
+        versionCode 8
+        versionName "2.2"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // UI 美化第三轮：接入 AndroidX + Material Components
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+}

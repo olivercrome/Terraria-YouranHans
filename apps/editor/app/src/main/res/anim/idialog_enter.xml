@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 全弹窗统一入场：纯 alpha 淡入(0→1)，无位移无缩放 → 各弹窗表现最一致，最不容易“下移/闪现”。 -->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:fillAfter="true">
+    <alpha
+        android:fromAlpha="0.0"
+        android:toAlpha="1.0"
+        android:interpolator="@android:anim/decelerate_interpolator"
+        android:duration="150" />
+</set>

@@ -23,7 +23,7 @@
         "DOWN": "下"
     },
     "Language": {
-        "English": "悠然汉化修正V8.2.2",
+        "English": "悠然汉化修正V8.2.3",
         "Spanish": "在此特别感谢:二柱子,lzup的技术指导!!",
         "French": "本汉化修正版本完全免费！禁止商业用途！抵制倒卖！",
         "Italian": "汉化成员:B站(悠然_ing),(Dr.克伦威尔)",
@@ -113,7 +113,7 @@
         "BanMessage": "已从服务器封禁。",
         "InvalidCommand": "无效命令。",
         "SetInitialPort": "服务器端口（按回车表示7777）:",
-        "AutomaticPortForward": "自动转发端口？（是/否）：",
+        "AutomaticPortForward": "自动转发端口？（是\/否）：",
         "Yes": "是",
         "ShortYes": "是",
         "No": "否",
@@ -145,7 +145,7 @@
         "WorldNameLengthTooLong": "所输入的世界名称太长！（字符数上限：{0}）",
         "SeedLengthTooLong": "所输入的种子太长！（字符数上限：{0}）",
         "SecretSeedEnabled": "秘密已激活！",
-        "EnterSeedToggleNumber": "输入种子编号以启用 / 禁用（留空即可继续）："
+        "EnterSeedToggleNumber": "输入种子编号以启用 \/ 禁用（留空即可继续）："
     },
     "UI": {
         "Effects": "效果",
@@ -362,7 +362,7 @@
         "PreviewArmorHallowed": "预览神圣盔甲",
         "PreviewArmorFormal": "预览正装",
         "PreviewArmorSwimming": "预览泳装",
-        "ItemSetBonusEquipped": "套装奖励({Numerator}/{Denominator})\\ {Description}",
+        "ItemSetBonusEquipped": "套装奖励({Numerator}\/{Denominator})\\ {Description}",
         "ItemSetBonusGeneral": "套装奖励：{Description}",
         "ItemSetBonusDecidedByHead": "随头部装备改变",
         "ItemSetBonusDecidedByBody": "随躯干装备改变",
@@ -401,7 +401,34 @@
         "SwitchPage": "切换页面",
         "HousingAssign": "分配{0}",
         "HousingEvict": "解除{0}",
-        "HousingAim": "瞄准"
+        "HousingAim": "瞄准",
+        "ItemLoadoutShareHint": "按 <share> 在不同配装间共享",
+        "ItemLoadoutShareHint2": "按 <share> 在不同配装间共享",
+        "ItemLoadoutShared": "与其他配装共享",
+        "ItemLoadoutSharedFrom": "共享自配装{0}",
+        "PortraitsDetailed": "肖像风格：精细",
+        "PortraitsCloseUp": "肖像风格：侧面",
+        "PortraitsFullBody": "肖像风格：复古",
+        "PortraitsDisabled": "肖像风格：禁用",
+        "FlashyEffectsWorldOn": "雷电特效：开",
+        "FlashyEffectsWorldOff": "雷电特效：减弱",
+        "FlashyEffectsInterfaceOn": "物品栏特效：开",
+        "FlashyEffectsInterfaceOff": "物品栏特效：减弱",
+        "PlayWhenUnfocusedOn": "失去焦点时暂停：关",
+        "PlayWhenUnfocusedOff": "失去焦点时暂停：开",
+        "DoubleTapDash": "双击冲刺",
+        "Dash": "冲刺",
+        "ToggleClassicGrid": "制作窗口样式",
+        "PreviousLoadout": "上一配装",
+        "NextLoadout": "下一配装",
+        "ArmorSetAbility": "盔甲套装能力",
+        "PanControlMode": "向前缩放",
+        "PanControlMode_OnAlways": "始终开启",
+        "PanControlMode_OffAlways": "始终关闭",
+        "PanControlMode_Click": "点击切换",
+        "PanControlMode_Hold": "按住使用",
+        "LookAheadGamepadInstruction": "缩放",
+        "Digtoise": "碎岩龟"
     },
     "CaptureBiomeChoice": {
         "0": "自动",
@@ -501,7 +528,7 @@
         "FromTerrariaModsDescription": "含有基于模组内容的资源包。",
         "PopularCulture": "流行文化",
         "PopularCultureDescription": "充满流行文化的资源包。",
-        "FunSilly": "有趣/蠢萌",
+        "FunSilly": "有趣\/蠢萌",
         "FunSillyDescription": "含有趣事和蠢事的资源包。你的弥母来了！",
         "Music": "音乐",
         "MusicDescription": "可调整泰拉瑞亚音乐的资源包，赋予新的氛围！",
@@ -548,7 +575,8 @@
         "CannotTeleportToPylonBecauseNotEnoughNPCsAtCurrentPylon": "你所在的城镇村民不够多（需要至少2个）",
         "CannotTeleportToPylonBecauseThereIsDanger": "请先清理世界上的BOSS或入侵才能使用晶塔网络！",
         "CannotTeleportToPylonBecauseNotMeetingBiomeRequirements": "此晶塔放置在了错误的生物群落",
-        "CannotTeleportToPylonBecauseAccessingLihzahrdTempleEarly": "古老的力量阻止你进入这个位置…"
+        "CannotTeleportToPylonBecauseAccessingLihzahrdTempleEarly": "古老的力量阻止你进入这个位置…",
+        "SteamHostOnlyAllowsFriends": "只有房主的Steam好友才能进入此服务器"
     },
     "GameUI": {
         "Storm": "暴风雨(+20%渔力)",
@@ -614,7 +642,7 @@
         "NotEnoughWater": "水量不够！",
         "FullFishingPower": "{0}({1}%)点渔力",
         "PrecentFishingPower": "{0}%渔力",
-        "BaitRequired": "需要鱼饵才能抓鱼，每次收杆有1/7概率断线",
+        "BaitRequired": "需要鱼饵才能抓鱼，每次收杆有1\/7概率断线",
         "BaitPower": "{0}%鱼饵力",
         "HairStyle": "换发型",
         "CraftingWindow": "打开合成窗口",
@@ -683,7 +711,8 @@
         "SuperCartEnabled": "矿车：强化",
         "SuperCartDisabled": "矿车：普通",
         "BannersWindow": "旗帜窗口",
-        "BannersTitle": "旗帜"
+        "BannersTitle": "旗帜",
+        "NotEnoughMaterials": "材料不足"
     },
     "Controls": {
         "LeftClick": "左键点击",
@@ -925,7 +954,8 @@
         "VampireBurningInDaylight_3": "{0}曾经不是日行者。",
         "VampireBurningInDaylight_4": "{0}忘记了夏令时。",
         "VampireBurningInDaylight_5": "{0}烤焦了。",
-        "VampireBurningInDaylight_6": "{0}把自己烤熟了。"
+        "VampireBurningInDaylight_6": "{0}把自己烤熟了。",
+        "Spored": "{0}感染孢子而死"
     },
     "Misc": {
         "ForceWaterSettling": "迫使流水停止。",
@@ -972,7 +1002,8 @@
         "Gold": "金",
         "Silver": "银",
         "Copper": "铜",
-        "DefenderMedals": "护卫奖章"
+        "DefenderMedals": "护卫奖章",
+        "DefenderMedals_PriceText": "护卫奖章"
     },
     "Achievements": {
         "ChallengerCategory": "挑战者",
@@ -1216,7 +1247,7 @@
         "DRINK_BOTTLED_WATER_WHILE_DROWNING_Name": "不寻常的生存策略",
         "DRINK_BOTTLED_WATER_WHILE_DROWNING_Description": "在溺水时喝一瓶水，真的很不寻常。\n（这有啥用啊，而且为什么都快要淹死了还喝水？）",
         "ALL_TOWN_SLIMES_Name": "史莱姆大分裂",
-        "ALL_TOWN_SLIMES_Description": "找到所有史莱姆宠物并让它们搬进来！",
+        "ALL_TOWN_SLIMES_Description": "找到所有的史莱姆宠物并让它们搬进来！",
         "TRANSMUTE_ITEM_Name": "暗中微光",
         "TRANSMUTE_ITEM_Description": "把一个物品放进微光来变成另一个物品。你还能找到哪些其他变化？",
         "PURIFY_ENTIRE_WORLD_Name": "终于净化了！",
@@ -1225,7 +1256,7 @@
         "TO_INFINITY_AND_BEYOND_Description": "让无人机飞向外太空\n（无人机：我免费辣！）",
         "BOOK_WORM_Name": "书虫",
         "BOOK_WORM_Description": "将整个世界的生物全都编入图鉴。",
-        "BOULDER_LORD_Name": "巨石之主",
+        "BOULDER_LORD_Name": "月球之主",
         "BOULDER_LORD_Description": "向月亮领主最强大的仆从证明你的实力。",
         "QUEEN_MACHINE_Name": "机械女王",
         "QUEEN_MACHINE_Description": "战胜三大机械巨兽的合体真身。",
@@ -3786,6 +3817,8 @@
         "endlessChristmas": "看看树下有什么……（圣诞节事件永久生效）",
         "vampirism": "你得涂 SPF9000 防晒霜了。（玩家为吸血鬼 —— 务必避开阳光）",
         "teamBasedSpawns": "别踏入我们的地盘！（玩家出生点按队伍颜色区分）",
-        "dualDungeons": "买一地牢送一！（双倍地牢探索体验）"
+        "dualDungeons": "买一地牢送一！（双倍地牢探索体验）",
+        "moreLightning": "宙斯不悦（更多雷击）",
+        "noLightning": "宙斯息怒了（禁用雷击）"
     }
 }

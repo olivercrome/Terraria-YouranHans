@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">YouranEditor</string>
+    <string name="empty_folder">没有找到 .json 翻译文件\n请先在上方选择汉化分支目录</string>
+    <string name="menu_open_folder">打开文件目录</string>
+    <string name="label_editing">翻译条目编辑</string>
+    <string name="save">保存</string>
+    <string name="cancel">取消</string>
+    <string name="delete">删除</string>
+    <string name="ok">确定</string>
+    <string name="menu_about">关于</string>
+
+    <!-- 引导语：初始(未打开文件)显示 -->
+    <string name="welcome_hint">\n\n    打开左上角菜单选择一个汉化分支，\n    再点其中某个 .json 文件开始编辑。\n    · 未绑定目录时使用本地草稿库\n    · 每层末尾可「＋ 新建 key」</string>
+
+    <!-- 顶栏图标文字(用符号文本替代图标资源，零 drawable) -->
+    <string name="hamburger">☰</string>
+    <string name="save_label">保存</string>
+    <string name="search_label">搜索</string>
+    <string name="search_hint">输入 key 或文本，回车/点按钮搜索 (可搜 key 与 value)</string>
+
+    <!-- 侧栏无 .json 时的提示 -->
+    <string name="branch_no_file">该分支下暂无 .json 文件</string>
+
+    <!-- 抽屉：点某行打开文件前的状态文字 -->
+    <string name="open_branch_hint">点击目录图标为分支绑定目录</string>
+
+    <!-- 新建 key 对话框 -->
+    <string name="add_key_title">新建 key</string>
+    <string name="prompt_key">key 名称</string>
+    <string name="prompt_value">值(可选，留空则仅建空 key)</string>
+
+    <!-- 重命名对话框 -->
+    <string name="rename_title">重命名</string>
+    <string name="rename_hint_for">当前: %1$s</string>
+
+    <!-- 删除确认 -->
+    <string name="confirm_delete_folder">删除整个分支目录下的所有文件？\n(该操作不可撤销)</string>
+    <string name="confirm_delete_file">删除文件 %1$s ？\n(该操作不可撤销)</string>
+    <string name="delete_ok">已删除</string>
+
+    <!-- 保存相关 -->
+    <string name="save_done">已保存</string>
+    <string name="nothing_to_save">没有需要保存的改动</string>
+    <string name="need_branch">请先选择一个分支</string>
+    <string name="saved_to">已保存到 %1$s</string>
+    <string name="settings_label">设置</string>
+</resources>

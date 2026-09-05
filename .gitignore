@@ -1,0 +1,31 @@
+# —— Gradle / Android(editor 子树) ——
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+local.properties
+captures/
+.cxx/
+
+# —— 构建/调试日志残留 ——
+*.log
+*.pid
+*.predictions
+hs_err_pid*
+
+# —— 本机/工具 —
+.devx*/
+.devxrc*
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# —— 可选的本地大缓存 ——
+.gradle-8.7/
+
+# —— 不要上传调试与临时 ——
+*.tail.txt
+*.bgt*
+*.testlib*

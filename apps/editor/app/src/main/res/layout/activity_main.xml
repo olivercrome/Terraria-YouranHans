@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  顶层根：全屏 FrameLayout，内部依次：
+    - main body  (垂直：title bar + content FrameLayout)
+    - scrim      (可点击的半透明遮罩，点它关抽屉)
+    - drawer     (左侧滑出面板，放分支列表)
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- 主内容：顶栏(汉堡 + title + 右上角保存) + 内容区 -->
+    <LinearLayout
+        android:id="@+id/mainBody"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:id="@+id/topBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#2C7BB6">
+
+            <!-- 汉堡按钮(打开/关闭抽屉) -->
+            <TextView
+                android:id="@+id/btnMenu"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:paddingLeft="14dp"
+                android:paddingRight="14dp"
+                android:paddingTop="12dp"
+                android:paddingBottom="12dp"
+                android:text="@string/hamburger"
+                android:textColor="#FFFFFF"
+                android:textSize="20sp" />
+
+            <TextView
+                android:id="@+id/title"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:padding="8dp"
+                android:text="@string/app_name"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:singleLine="true"
+                android:ellipsize="end" />
+
+            <!-- 保存记录按钮：在搜索左侧(🔍)，点开查看过往保存历史 -->
+            <ImageView
+                android:id="@+id/btnSaveHistory"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_vertical"
+                android:padding="10dp"
+                android:contentDescription="保存记录"
+                android:src="@drawable/ic_history" />
+
+            <!-- 搜索按钮放大镜：在保存左侧 -->
+            <ImageView
+                android:id="@+id/btnSearch"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_vertical"
+                android:padding="12dp"
+                android:contentDescription="@string/search_label"
+                android:src="@drawable/ic_search" />
+
+            <!-- 保存按钮：紧挨标题右，用图标；默认灰，有 dirty 才点亮 -->
+            <ImageView
+                android:id="@+id/btnSave"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_vertical"
+                android:padding="12dp"
+                android:contentDescription="@string/save_label"
+                android:src="@drawable/ic_save" />
+
+            <!-- 最右设置按钮⚙ -->
+            <ImageView
+                android:id="@+id/btnSettings"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_vertical"
+                android:padding="14dp"
+                android:contentDescription="@string/settings_label"
+                android:src="@drawable/ic_settings_gear" />
+        </LinearLayout>
+
+        <FrameLayout
+            android:id="@+id/content"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+    </LinearLayout>
+
+    <!-- 半透明遮罩，覆盖在主内容上，点它关闭抽屉 -->
+    <View
+        android:id="@+id/scrim"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#88000000"
+        android:visibility="gone" />
+
+    <!-- 左侧抽屉面板：宽度约主屏 80%，白色背景，放分支列表 -->
+    <LinearLayout
+        android:id="@+id/drawer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:orientation="vertical"
+        android:background="#FFFFFF"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/drawerHeader"
+            android:orientation="horizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#1E5D8F"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/drawerHeaderTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:padding="16dp"
+                android:text="汉化分支"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <!-- 右上角＋：新建汉化分支(存 App 私有目录) -->
+            <TextView
+                android:id="@+id/draftBtnPlus"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:gravity="center"
+                android:text="＋"
+                android:textSize="26sp"
+                android:textColor="#FFFFFF" />
+        </LinearLayout>
+
+        <ListView
+            android:id="@+id/drawerList"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:divider="#EEE"
+            android:dividerHeight="1dp" />
+    </LinearLayout>
+</FrameLayout>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Pure platform theme; no AndroidX/Material required. -->
+    <style name="Theme.Youran" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">#2C7BB6</item>
+        <item name="android:colorPrimaryDark">#1E5D8F</item>
+        <item name="android:colorAccent">#2C7BB6</item>
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:statusBarColor">#1E5D8F</item>
+    </style>
+</resources>
