@@ -110,6 +110,10 @@ public class MainActivity extends Activity {
 
     // 分支“导出”回调期对象：在 SAF 确认导出位置后才真正收集该分支 json
     private Branch branchForExport;
+    // 编辑保存保位：点下“要去编辑的叶子/新建”那一行的瞬间记住此刻首可见行，
+    // 保存后重建不要依赖“保存回调时实时列表”(那时可能已被重排回顶)，用这一份定位。
+    private int saveKeepRow = -1;
+    private String saveKeepKey = null;   // 保位首选：被编辑的那条 key(可改名则退(回退)到行号)
 
     private static final int REQ_PICK_DIR = 1001;
     private static final int REQ_PICK_BG   = 1002;   // 设置里选背景图
@@ -162,7 +166,7 @@ public class MainActivity extends Activity {
         scrim.setOnClickListener(v -> closeDrawer());
         drawerList.setOnItemClickListener((p, v, pos, l) -> {
             closeDrawer();
-            onBranchSelected(currentBranchList.get(pos));
+            switchToBranchGuarded(currentBranchList.get(pos));
         });
         drawerList.setOnItemLongClickListener((p, v, pos, l) -> {
             if (pos < 0 || pos >= currentBranchList.size()) return true;
@@ -1389,6 +1393,28 @@ public class MainActivity extends Activity {
     }
 
     /** 抽屉里点某分支：若未绑定 SAF 先绑定，否则列其 json 文件。 */
+    /** 抽屉点某分支的可选守卫：有未保存改动就先弹警示，确认=自动保存后再切换；
+     *  返回=留在原处，绝不丢改动。 */
+    private void switchToBranchGuarded(final Branch br) {
+        if (tree == null || openName == null || !tree.isDirty()) {
+            onBranchSelected(br);
+            return;
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("尚未保存")
+                .setMessage("当前修改还没保存。前往分支前会先自动保存；\n“返回”则留在原处不影响。")
+                .setNegativeButton("返回", null)
+                .setPositiveButton("保存并前往", (d, w) -> {
+                    doSave();
+                    if (tree != null && tree.isDirty()) {
+                        toast("保存未完成，已留在当前分支");
+                        return;
+                    }
+                    onBranchSelected(br);
+                })
+                .show();
+    }
+
     private void onBranchSelected(Branch br) {
         currentBranch = br;
         atWelcomePage = false;   // 已离开引导首页(即便此刻才停在“选择 json”列表)：返回都应回 renderWelcome 首页
@@ -1881,8 +1907,13 @@ public class MainActivity extends Activity {
         // 记住“本次要回到”的分层：同深度重建(如编辑保存/加 key)照旧停在那里，避免列表顶回
         String sigNow = joinPath(path);
         boolean sameGen = !liveSig.isEmpty() && liveSig.equals(sigNow);
-        final int keepRow = (sameGen && liveListLv != null)
-                ? Math.max(0, liveListLv.getFirstVisiblePosition() - 0) : 0;
+        final int keepRow;
+        if (sameGen && saveKeepRow >= 0) {
+            keepRow = saveKeepRow;                         // 用户刚点“去编辑那行”→ 保存后回到约那行
+            saveKeepRow = -1;                              // 一次性消费，防没有编辑的普通刷新使用旧值
+        } else {
+            keepRow = (sameGen && liveListLv != null) ? Math.max(0, liveListLv.getFirstVisiblePosition()) : 0;
+        }
         liveSig = sigNow;
 
         List<Object> items = new ArrayList<>(); // String key 或 特殊类型
@@ -1906,23 +1937,39 @@ public class MainActivity extends Activity {
                 lv.post(() -> lv.setSelectionFromTop(rr, 0));
                 lv.postDelayed(() -> lv.setSelectionFromTop(rr, 0), 90);
             }
-        } else if (sameGen && keepRow > 0) {
-            // 同深度的小规模重建(如：编辑 value 后保存/加子 key)：停在原本大致那行，顶部不闪回
-            final int kr = Math.min(keepRow, adapter.keys.size());
-            if (kr >= 0) lv.post(() -> lv.setSelection(kr));
+        } else if (sameGen) {
+            // 同深度的小规模重建(如：编辑 value 后保存/加子 key)。
+            // 要求：关弹窗后列表“纹丝不动”——保持你原本视口的那一行作新列表顶，
+            // 不做居中、不加偏移、不额外滚动(仅当它确实在你原位置的上一屏时兜一帧)。
+            int n = adapter.keys.size();
+            if (n > 0) {
+                int target = -1;
+                if (saveKeepKey != null) target = adapter.keys.indexOf(saveKeepKey); // 改名会 -1 → 退回行号
+                if (target < 0) target = Math.min(keepRow, n - 1);
+                int from = Math.max(0, Math.min(target, n - 1));   // 保持原样：首可见=目标行，不居中偏置
+                lv.setSelectionFromTop(from, 0);
+            }
         }
         // 每次重建完成后记录“当下列表”，供下次同深度重建时参照
         liveListLv = lv;
         // 用完后回收临时态(避免用户后续在不同层操作残留蓝色)
         hlFile = null; hlSegs = null; hlKey = null;
         lv.setOnItemClickListener((p, v, pos, id) -> {
-            // 最后一行为「＋ 新建」占位
-            if (pos >= items.size()) { promptAddKey(container); return; }
+            // 先记住“此刻停在第几可见行”和被编辑的 key，保存后重建据此返回，避免回到页顶。
+            if (pos >= items.size()) {
+                saveKeepRow = Math.max(0, lv.getFirstVisiblePosition());
+                saveKeepKey = null;
+                promptAddKey(container); return;
+            }
             String key = items.get(pos).toString();
             if (tree.isObjectValue(container, key)) {
+                saveKeepRow = -1;                 // 换层：交给子层自己的首刷，不沿用叶子的保位
+                saveKeepKey = null;
                 path.add(key);
                 renderContainer();
             } else {
+                saveKeepRow = Math.max(0, lv.getFirstVisiblePosition());
+                saveKeepKey = key;                // 锚点用“被编辑的这行”
                 promptEditLeaf(container, key);
             }
         });
@@ -2038,7 +2085,15 @@ public class MainActivity extends Activity {
         valInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
                 | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         styleEditBox(valInput);
-        if (val != null && !(val instanceof JSONObject) && !(val instanceof JSONArray)) {
+        // 值为 JSON null 时：不把“null”当文本塞进框(会像真内容)——
+        // 置空 + 灰色占位 (null)，让用户看懂这是空值；写入任意内容即把它替换。
+        boolean originNull = (val instanceof JSONObject) ? false
+                : (val instanceof JSONArray) ? false
+                : container.isNull(key);
+        if (originNull) {
+            valInput.setText("");
+            valInput.setHint("(null)   —  当前是空值；写内容即替换，想保持 null 请清空");
+        } else if (val != null && !(val instanceof JSONObject) && !(val instanceof JSONArray)) {
             valInput.setText(String.valueOf(val));
         }
         box.addView(valInput, new LinearLayout.LayoutParams(
@@ -2063,6 +2118,14 @@ public class MainActivity extends Activity {
                         toast("同层已有该 key: " + nk); return;
                     }
                     String raw = valInput.getText().toString();
+                    // null 值特殊语义：没写新内容=保持 null；写入了才替换(见预填框的灰字提示)
+                    if (originNull) {
+                        if (raw.trim().isEmpty()) {
+                            // 用户取消都没变化 → 原样保持 null，直接收键盘/关
+                            dlg.dismiss(); refreshSaveButton(); renderContainer(); return;
+                        }
+                        toast("此值原本是 (null) 空值：现用你写的内容替换(若是误写想保留 null，请再清空保存)");
+                    }
                     String perr = JsonModel.validateValue(raw);
                     if (perr != null) { toast("占位符检查: " + perr); return; }
                     // 先改值，再改名(若变了)

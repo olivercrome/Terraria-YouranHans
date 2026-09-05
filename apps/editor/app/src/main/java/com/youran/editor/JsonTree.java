@@ -208,23 +208,17 @@ final class JsonTree {
     // ---- 值文本 -> 类型化 JSON 值 -----------------------------------------
 
     /**
-     * 把用户输入框里的"值文本"转为 JSON 值：{\...}⇒对象、[\...]⇒数组、
-     * true/false/null⇒对应、数字⇒数值，否则当普通字符串(原文存最新)。
+     * 把“叶子值输入框”的文本转为可放入 JSON 的标量值，规则只做标量：
+     *   "true"/"false"/"null" → 布尔 / JSONObject.NULL
+     *   纯数字 → number
+     *   其它一律当普通字符串(保留原样，含 {$...}、[color=..]、换行…)。
+     * 对象/数组不适合由一段文本“猜”出来，需要用「＋ 对象壳」/「＋数组壳」构造，
+     * 以免把 {$LegacyMenu.58} 这类本地化原文误判成 JSON 对象卡住保存。
      */
     private static Object parseValueQuiet(String s) throws JSONException {
         if (s == null) return JSONObject.NULL;
         String t = s.trim();
         if (t.isEmpty()) return "";
-        if (t.startsWith("{") && t.endsWith("}")) {
-            Object o = new JSONTokener(t).nextValue();
-            if (o instanceof JSONObject) return o;
-            throw new JSONException("对象写法有误");
-        }
-        if (t.startsWith("[") && t.endsWith("]")) {
-            Object o = new JSONTokener(t).nextValue();
-            if (o instanceof JSONArray) return o;
-            throw new JSONException("数组写法有误");
-        }
         if (t.equals("true")) return Boolean.TRUE;
         if (t.equals("false")) return Boolean.FALSE;
         if (t.equals("null")) return JSONObject.NULL;
