@@ -9,6 +9,8 @@ import android.graphics.Bitmap;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -34,7 +36,9 @@ import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 便携汉化 JSON 编辑 App 主界面(MVP)：
@@ -56,6 +60,9 @@ public class MainActivity extends Activity {
     private TextView title;
     // 保存后/重建列表仍停在同一深度的大致位置(避免“更新 key 后列表顶回”)
     private ListView liveListLv;
+    private ListView curLv;        // 当前容器列表(供顶/底“快速滑到”)引用
+    private final Handler wsBufHandler = new Handler(Looper.getMainLooper()); // 防崩溃草稿写盘用
+    private boolean wsBufScheduled = false;
     private String liveSig = "";
     private int liveAnchor;
     private ListView drawerList;
@@ -138,6 +145,917 @@ public class MainActivity extends Activity {
     private int saveKeepRow = -1;
     private String saveKeepKey = null;   // 保位首选：被编辑的那条 key(可改名则退(回退)到行号)
 
+    // 记录页·删除型本地记录(仅当次会话;进程结束自动清，不必额外“退出清空”)
+    private final java.util.List<DelRec> dels = new java.util.ArrayList<>();
+    private static final class DelRec {   // 一条删除型记录
+        final String file; final java.util.List<String> seg; final String key;
+        final String snap;   // 待删当时内容快照(供回收站关&同会话直接恢复)
+        boolean saved;       // false=仍是“待删(还能跳过去看)”, true=已总保存真删
+        DelRec(String file, java.util.List<String> seg, String key, String snap, boolean saved) {
+            this.file=file; this.seg=seg; this.key=key; this.snap=snap; this.saved=saved;
+        }
+    }
+    /** 由“点删除(进待删)”在登记后调用：记成一条状态 PENDING 的删除型记录。 */
+    private void logDel(java.util.List<String> seg, String key, JSONObject container) {
+        if (tree == null || openName == null) return;
+        String snap = "";
+        try {
+            Object vo = container != null ? container.opt(key) : null;
+            if (vo != null) snap = vo.toString();
+        } catch (Exception ignored) {}
+        java.util.List<String> copySeg = new java.util.ArrayList<>(seg);
+        for (DelRec d : dels)  // 已在“同一未完成待删”里：仅更新快照不重复
+            if (d.file.equals(openName) && !d.saved && sameSeg(d.seg, copySeg) && d.key.equals(key)) return;
+        dels.add(new DelRec(openName, copySeg, key, snap, false));   // 否则记新一条(即使是重删同名)
+    }
+    // ================== 回收站·存储层(本地四夹 files) ==================
+    private static final String[] RC_KINDS = {"branches","json","block","key"};
+    private File rcFolder(String kind) { return new File(recycleRoot(), kind); }
+    private File recycleRoot() { return new File(rootDir, "recycle"); }
+    private void ensureRecycleDirs() {
+        try { recycleRoot().mkdirs(); for (String k : RC_KINDS) rcFolder(k).mkdirs(); } catch (Exception ignored) {}
+    }
+    private int recycleCount() {
+        ensureRecycleDirs(); int n = 0;
+        for (String k : RC_KINDS) { String[] c = rcFolder(k).list(); if (c != null) n += c.length; }
+        return n;
+    }
+    // ============== 回收站全局映射清单 recycle/.index.json ==============
+    // 每个真实收进(key/块/json/分支)都会在此登记一条：“同一来源(srcPath 前缀) 的多份备份可一并管理”。
+    private File idxFile() { return new File(recycleRoot(), ".index.json"); }
+    /** 读取清单并自愈：凡指向的文件/目录已不存在(被恢复/被彻底删)的行即时剔除并回写。 */
+    private JSONArray idxLoad() {
+        java.io.File f = idxFile(); JSONArray arr = new JSONArray();
+        try { if (f.exists()) arr = new JSONArray(readAll(f)); } catch (Exception ignored) { }
+        try {
+            boolean dirty = false; JSONArray alive = new JSONArray();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i); if (o == null) continue;
+                String kind = o.optString("kind"), file = o.optString("file");
+                java.io.File fc = new java.io.File(rcFolder(kind), file);
+                if (fc.exists()) { alive.put(o); } else dirty = true;
+            }
+            if (dirty) idxSave(alive);
+            return alive;
+        } catch (Exception e) { return arr; }
+    }
+    private void idxSave(JSONArray arr) {
+        try { ensureRecycleDirs(); writeJsonAstex(idxFile(), arr.toString(2)); } catch (Exception ignored) { }
+    }
+    /** 登记/合并一条 index；同 kind+同 hash(即同一次删除事件)幂等。 */
+    private void idx_push(String kind, String file, String srcPath, String branch, String realName) {
+        try {
+            JSONArray a = idxLoad();
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i);
+                if (o != null && kind.equals(o.optString("kind")) && file.equals(o.optString("file"))) return; // 已有
+            }
+            JSONObject o = new JSONObject();
+            o.put("kind", kind); o.put("file", file); o.put("srcPath", srcPath == null ? "" : srcPath);
+            o.put("branch", branch == null ? "" : branch); o.put("realName", realName == null ? "" : realName);
+            o.put("at", System.currentTimeMillis());
+            a.put(o); idxSave(a);
+        } catch (Exception ignored) { }
+    }
+    /** 删某夹内单个文件时同步摘除其 index 行；file 可传文件名或目录名。 */
+
+    /** 面板标题辅助：该 kind 下不同“源分支/文件”种数(取自 .index.json)，同来源聚合一目了然。 */
+    private int idxSrcCount(String kind) {
+        java.util.Set<String> s = new java.util.HashSet<>();
+        try {
+            JSONArray a = idxLoad();
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i); if (o == null) continue;
+                if (!kind.equals(o.optString("kind"))) continue;
+                String sp = o.optString("srcPath", "");
+                if (sp.trim().length() == 0) continue;
+                s.add(sp.trim());   // 同源即同一 srcPath 串；跨类型聚合可再按 srcPath 全等/前缀归并
+            }
+        } catch (Exception ignored) { }
+        return s.size();
+    }
+
+    private String rcName(String kind, String thumb) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            md.update((kind + "|" + thumb + "|" + System.currentTimeMillis()).getBytes("UTF-8"));
+            byte[] d = md.digest(); StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 4; i++) sb.append(String.format("%02x", d[i] & 0xff));
+            return sb.toString() + ".json";
+        } catch (Exception e) { return System.currentTimeMillis() + ".json"; }
+    }
+    private boolean recyclePut(String kind, String thumb, JSONObject data) {
+        if (!recycleEnabled()) return false;
+        final int lim = RC_LIMITS[upperIndexNow()];
+        if (lim > 0 && kindCount(kind) >= lim) return false;     // 超上限熔断: 该夹已达上限则不再写入
+        try {
+            ensureRecycleDirs();
+            JSONObject wrap = new JSONObject();
+            wrap.put("kind", kind); wrap.put("orig", thumb);
+            wrap.put("put_at", System.currentTimeMillis()); wrap.put("data", data);
+            java.io.File f = new java.io.File(rcFolder(kind), rcName(kind, thumb));
+            java.io.FileOutputStream o = new java.io.FileOutputStream(f);
+            o.write(wrap.toString(2).getBytes("UTF-8")); o.close();
+            // 分支从 srcPath(thumb) 派生出：srcPath=完整显示路径；branch=第一段目录可视名由调用方回填于 wrap.orig
+            String srcP = thumb != null ? thumb : "";
+            String br = (wrap.optString("branch", "").length() == 0)
+                    ? (srcP.indexOf('/') > 0 ? srcP.substring(0, srcP.indexOf('/')) : "") : wrap.optString("branch", "");
+            idx_push(kind, f.getName(), srcP, br, null);
+            return true;
+        } catch (Exception e) { return false; }
+    }
+    /** 叶子→key、对象块→block, 在真删仍“存在于树”的瞬间调用。 */
+    private void recycleFromPendingRemove(java.util.List<String> seg, String key) {
+        if (!recycleEnabled() || tree == null) return;
+        try {
+            JSONObject c = tree.containerAt(new java.util.ArrayList<String>(seg));
+            if (c == null) return;
+            Object v = c.opt(key);
+            if (v == null) return;
+            // “内容态剥离”：若当前 json 根只包了唯一一个对象壳(外层诸如此类“/顶层”外壳)，
+            // 记录 seg 时把该外壳键从最前面剥掉 → key/块/恢复/兜底统一以“内容开头”，不会再带回外壳层
+            java.util.List<String> segVis = new java.util.ArrayList<>(seg);
+            try {
+                JSONObject root0 = (tree != null) ? tree.rootObject() : null;
+                if (root0 != null && root0.length() == 1) {
+                    // 文件被单对象壳包着(如外层 /顶层)：seg 未必带它名 → 不做键名比对；
+                    // 一旦确定“单壳”，若 seg 第一段就是该壳名则剥掉；即使不在首段，
+                    // 兜底写回时以内容为根，不再把壳带进新文件，这由恢复侧统一实现。
+                    java.util.Iterator<String> it = root0.keys();
+                    String shellKey = it.hasNext() ? it.next() : null;
+                    if (shellKey != null && !segVis.isEmpty() && shellKey.equals(segVis.get(0))) {
+                        segVis.remove(0);
+                    }
+                }
+            } catch (Exception ignore) { }
+            String brTtl = currentBranch != null && currentBranch.title != null ? currentBranch.title : "?";
+            JSONObject p = new JSONObject();
+            p.put(key, v);
+            String thumbK = brTtl + "/" + (openName != null ? openName : "file") + "::" + joinPath(segVis) + "." + key;
+            recyclePut(v instanceof JSONObject ? "block" : "key", thumbK, p);
+        } catch (Exception ignored) {}
+    }
+    /** 整个分支工作夹收进回收站 branches/<hash>/（回收站开才拷贝）。 */
+    private void recycleBranchFs(java.io.File srcDir, String titleHint) {
+        if (!recycleEnabled() || srcDir == null || !srcDir.isDirectory()) return;
+        try {
+            ensureRecycleDirs();
+            String name = rcName("branches", (titleHint == null ? "" : titleHint));
+            java.io.File dst = new java.io.File(rcFolder("branches"), name);
+            dst.mkdirs();
+            java.io.File[] kids = srcDir.listFiles();
+            if (kids != null) for (java.io.File k : kids) copyRec(k, new java.io.File(dst, k.getName()));
+            try { writeLocal(new java.io.File(dst, "_srcid"), srcDir.getName()); } catch (Exception ignore) {}   // 记录原分支id(folder名)供恢复时 rekey 暂存
+            String th = (titleHint == null || titleHint.trim().isEmpty()) ? dst.getName() : titleHint;
+            idx_push("branches", dst.getName(), th, th, null);
+        } catch (Exception ignored) {}
+    }
+    /** 田字板四个夹的数字(各自 listFiles 长度;每夹 entry 数)。 */
+    private int kindCount(String kind) {
+        ensureRecycleDirs();
+        String[] c = rcFolder(kind).list();
+        return c == null ? 0 : c.length;
+    }
+    /** 回收站“设置·管理”页四个数字的 live view（于 openRecycleBoard 时填充）；任何改动经 afterRecycleChange() 即时更新，杜绝“要退出重进才变”。 */
+    private TextView[] rcTileLive = new TextView[4];
+    private TextView rcSettingVal;   // 设置页“回收站”行的右侧数字(供 live 刷新)
+    private void afterRecycleChange() {
+        refreshRcSettingVal();
+        for (int k = 0; k < rcTileLive.length; k++) {
+            if (rcTileLive[k] != null) {} }
+        final String[] kinds = {"branches","json","block","key"};
+        for (int k = 0; k < rcTileLive.length; k++) {
+            if (rcTileLive[k] == null) continue;
+            try { rcTileLive[k].setText(rcLabelOf(kinds[k]) + "\n" + kindCount(kinds[k]) + " 项"); } catch (Exception ignored) { }
+        }
+        if (rcHead != null && rcSubDlg != null && rcSubDlg.isShowing()) {} // rcSubDlg 由 refreshKeyList 自行重建
+    }
+    private void refreshRcSettingVal() {
+        if (rcSettingVal == null) return;
+        try { rcSettingVal.setText("已存 " + recycleCount()); } catch (Exception ignored) { }
+    }
+    private String rcLabelOf(String k) {
+        return "branches".equals(k) ? "分支" : ("json".equals(k) ? "json" : ("block".equals(k) ? "块" : "子项"));
+    }
+    private int upperIndexNow() {
+        // 0,50,100,200(序号存 pref rc_lim_idx,默认50)
+        return Math.min(3, Math.max(0, loadPrefInt("recycle_lim_idx", 1)));
+    }
+    private static final int[] RC_LIMITS = {0, 50, 100, 200};
+    private void saveUpperIndex(int index) { savePrefInt("recycle_lim_idx", index); }
+
+    /** 设置-回收站弹窗：左上标题/右上可用态单选刷文字 / 田字四钮(淡底) / 左下上限数字(滚轮0/50/100/200)。 */
+    private void openRecycleBoard() {
+        final String[] kinds  = {"branches","json","block","key"};
+        final String[] titles = {"分支","json","块","子项"};
+        int[] bg = {0xE0A0A0A0, 0xE07F9AD8, 0xE06ABf82, 0xE0C97878};
+
+        // ===== 整个可 view：单一圆角白底(外观为大圆角卡片) =====
+        LinearLayout whole = new LinearLayout(this);
+        whole.setOrientation(LinearLayout.VERTICAL);
+        whole.setPadding(dp(16), dp(14), dp(16), dp(12));
+        android.graphics.drawable.GradientDrawable shellbg = new android.graphics.drawable.GradientDrawable();
+        shellbg.setColor(0xFFFFFFFF); shellbg.setCornerRadius(dp(26));
+        whole.setBackground(shellbg);
+
+        // 顶栏：加大标题 + 是否(长按350)
+        LinearLayout top = new LinearLayout(this); top.setOrientation(LinearLayout.HORIZONTAL);
+        TextView ttl = new TextView(this); ttl.setText("回收站");
+        ttl.setTextSize(23f); ttl.setTypeface(Typeface.DEFAULT_BOLD); ttl.setTextColor(0xFF25232E);
+        top.addView(ttl, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        TextView ena = new TextView(this);
+        ena.setText(recycleEnabled() ? "◉ 已启用" : "○ 未启用");
+        ena.setTextSize(14f); ena.setTextColor(0xFF2F86FF); ena.setPadding(dp(8), dp(3), dp(2), dp(3));
+        final boolean[] arm = {false};
+        final android.os.Handler hk = new android.os.Handler(this.getMainLooper());
+        ena.setOnTouchListener((v, e) -> {
+            if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+                arm[0] = true;
+                hk.postDelayed(() -> { if (arm[0]) { boolean n = !recycleEnabled(); setRecycleEnabled(n); ena.setText(n ? "◉ 已启用" : "○ 未启用"); } }, 350);
+                return true;
+            } else if (e.getActionMasked() == android.view.MotionEvent.ACTION_UP || e.getActionMasked() == android.view.MotionEvent.ACTION_CANCEL) { arm[0] = false; return true; }
+            return true;
+        });
+        top.addView(ena, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        whole.addView(top);
+
+        // 田字四钮
+        for (int r = 0; r < 2; r++) {
+            LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL);
+            for (int j = 0; j < 2; j++) {
+                int i = r * 2 + j;
+                TextView c = new TextView(this);
+                rcTileLive[i] = c;                       // 接入 live：任何回收动作后计数即时更新
+                c.setText(titles[i] + "\n" + kindCount(kinds[i]) + " 项");
+                c.setTextSize(16f); c.setTextColor(0xFF111317); c.setGravity(Gravity.CENTER);
+                c.setPadding(dp(2), dp(22), dp(2), dp(22));
+                android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+                g.setColor(bg[i]); g.setCornerRadius(dp(16));
+                c.setBackground(g);
+                final int fidx = i;                                                   // 防闭包循环变量
+                c.setOnClickListener(v2 -> openRecycleList(kinds[fidx], titles[fidx]));
+                c.setClickable(true);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+                lp.setMargins(dp(4), dp(3), dp(4), dp(3));
+                row.addView(c, lp);
+            }
+            whole.addView(row);
+        }
+
+        // 左下：存储上限(小钮，与完成大体同行即可)
+        LinearLayout lowrow = new LinearLayout(this); lowrow.setOrientation(LinearLayout.HORIZONTAL);
+        TextView lim = new TextView(this); lim.setText("存储上限 " + RC_LIMITS[upperIndexNow()]);
+        lim.setTextSize(13f); lim.setTextColor(0xFF2F86FF); lim.setGravity(Gravity.CENTER);
+        lim.setIncludeFontPadding(false);
+        android.graphics.drawable.GradientDrawable gl = new android.graphics.drawable.GradientDrawable();
+        gl.setColor(0xFFEAF1FF); gl.setCornerRadius(dp(9)); gl.setStroke(dp(1), 0x33507BFF);
+        lim.setBackground(gl);
+        lim.setOnClickListener(v -> {
+            final android.widget.NumberPicker np = new android.widget.NumberPicker(this);
+            np.setMinValue(0); np.setMaxValue(RC_LIMITS.length - 1);
+            np.setDisplayedValues(new String[]{"0", "50", "100", "200"});
+            np.setWrapSelectorWheel(false); np.setValue(upperIndexNow());
+            new android.app.AlertDialog.Builder(this).setTitle("存储上限")
+                .setView(np)
+                .setPositiveButton("确认", (dg, w) -> { int idx = np.getValue(); saveUpperIndex(idx); lim.setText("存储上限 " + RC_LIMITS[idx]); })
+                .setNegativeButton("取消", null)
+                .create().show();
+        });
+        LinearLayout.LayoutParams lpLow = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(42));
+        lpLow.topMargin = dp(6);
+        lowrow.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        lowrow.addView(lim, lpLow);
+        whole.addView(lowrow);
+
+        // 完成 / 清空回收站：画进圆角壳内(系统风文字钮)，壳底留“下方余量(≈0.7cm)”让两钮不贴死外沿
+        LinearLayout act = new LinearLayout(this);
+        act.setOrientation(LinearLayout.HORIZONTAL);
+        act.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        TextView okB = new TextView(this); okB.setText("完成");
+        okB.setTextSize(16f); okB.setTextColor(0xFF2F86FF); okB.setPadding(dp(10), dp(4), dp(6), dp(4));
+        TextView clB2 = new TextView(this); clB2.setText("清空回收站");
+        clB2.setTextSize(16f); clB2.setTextColor(0xFFE74C3C); clB2.setPadding(dp(6), dp(4), dp(2), dp(4));
+        act.addView(okB);
+        act.addView(clB2);
+        whole.addView(act, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        // 按钮就放圆角壳内的最末行，不给壳再塞任何底部空白
+
+        final android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
+                .setTitle(null)
+                .setView(whole)
+                .setCancelable(true)
+                .create();
+        okB.setOnClickListener(v -> d.dismiss());
+        clB2.setOnClickListener(v -> {
+            for (String k : RC_KINDS) { java.io.File kf = rcFolder(k); if (kf.exists()) deleteDirRec(kf); kf.mkdirs(); }
+            toast("回收站已清空");
+            d.dismiss();
+        });
+        if (d.getWindow() != null) d.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
+        d.show();
+    }
+    /** 打开某类回收清单: 每份一行(文件名+体积/时间)可删除, 底部[清空此类]。恢复在下一步单独做。 */
+    /** 整份 json 回收：每份=原 json 整档。记录里有 realName(原真名)，恢复按 realName 落回原分支；hash 只管夹名不作恢复来源。 */
+    /** json 全档回收页：单击卡片进“单份”弹窗；删除/恢复后走 rcJsonRefresh(原地重建) 保持即时同步。 */
+    private void openRecycleJson(String title) {
+        rcJsonTitle = title;
+        rcJsonDlg = new android.app.AlertDialog.Builder(this).create();
+        rcBodyJson = buildJsonList(title);
+        if (rcBodyJson == null) { rcJsonDlg = null; showEmptyKinPanel(title, "json 回收夹"); return; }  // 空态
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        sv.addView(rcBodyJson, new android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout outer = new LinearLayout(this); outer.setOrientation(LinearLayout.VERTICAL);
+        outer.setPadding(dp(8), dp(6), dp(8), dp(2));
+        TextView ht = new TextView(this);
+        int n0 = (rcFolder("json").listFiles() == null ? 0 : rcFolder("json").listFiles().length);
+        ht.setText(title + " · " + n0 + " 份 · 源" + idxSrcCount("json"));
+        ht.setTextColor(0xFF252833); ht.setTextSize(16f); ht.setTypeface(Typeface.DEFAULT_BOLD); outer.addView(ht);
+        outer.addView(sv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        rcJsonDlg.setView(outer);
+        rcJsonDlg.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "返回",
+                (d, w) -> { rcJsonDlg = null; rcBodyJson = null; });
+        rcJsonDlg.show();
+    }
+    /** json 列表内容主体（不含滚动与标题）：空则 null(走空态)；仅供本页重绑定复用。 */
+    private LinearLayout buildJsonList(String tt) {
+        java.io.File dir = rcFolder("json"); java.io.File[] items = dir.listFiles();
+        if (items == null || items.length == 0) return null;
+        LinearLayout inner = new LinearLayout(this); inner.setOrientation(LinearLayout.VERTICAL);
+        for (java.io.File f : items) {
+            final java.io.File ff = f;
+            String realName = recFieldOf(ff, "realName", ff.getName());
+            String brTtl = recFieldOf(ff, "branchTitle", "?");
+            LinearLayout card = new LinearLayout(this); card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(dp(7), dp(3), dp(7), dp(3));
+            android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
+            gd.setColor(0xFFF4F6FC); gd.setCornerRadius(dp(9)); gd.setStroke(dp(1), 0x2F000000);
+            card.setBackground(gd);
+            addJsonL(card, "分支", brTtl);
+            addJsonL(card, "json", realName);
+            card.setOnClickListener(v -> askJsonEntry(ff));
+            inner.addView(card);
+            inner.addView(UiKit.spacer(MainActivity.this, 2));
+        }
+        return inner;
+    }
+    /** json 动作后刷新：若 json 回收页仍在显示则先关旧再开新版（避免叠层“看着不更新”）。 */
+    private void rcJsonRefresh() {
+        final String tt = (rcJsonTitle == null || rcJsonTitle.length() == 0) ? "json" : rcJsonTitle;
+        if (rcJsonDlg != null) { try { rcJsonDlg.dismiss(); } catch (Exception ignored) { } rcJsonDlg = null; rcBodyJson = null; rcJsonTitle = null; }
+        openRecycleJson(tt);
+    }
+    /** 空回收夹也正常打开弹窗，显示“（已空）”占位 —— 与子项/块一致，不再仅 toast */
+    private void showEmptyKinPanel(String title, String noun) {
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(10), dp(8), dp(10), dp(8));
+        TextView h0 = new TextView(this); h0.setText(title); h0.setTextSize(16f);
+        h0.setTypeface(Typeface.DEFAULT_BOLD); h0.setTextColor(0xFF252833); box.addView(h0);
+        TextView empty = new TextView(this); empty.setText("（" + noun + "已空）"); empty.setTextSize(14f);
+        empty.setTextColor(0xFF9AA1AC); empty.setGravity(android.view.Gravity.CENTER);
+        empty.setPadding(dp(0), dp(26), dp(0), dp(26)); box.addView(empty);
+        new android.app.AlertDialog.Builder(this).setTitle(null).setView(box)
+            .setNegativeButton("返回", null).show();
+    }
+    private void addJsonL(LinearLayout c, String tag, String v) {
+        TextView t = new TextView(this);
+        t.setText((tag + "：" + (v == null ? "—" : v)));
+        t.setTextSize(13f); t.setTextColor(0xFF33363E); t.setPadding(dp(2), dp(1), dp(2), dp(1));
+        c.addView(t);
+    }
+    private String recFieldOf(java.io.File f, String key, String dft) {
+        try { JSONObject j = new JSONObject(readAll(f)); String v = j.optString(key, dft); return v; }
+        catch (Exception e) { return dft; }
+    }
+    private void askJsonEntry(final java.io.File ff) {
+        LinearLayout pv = new LinearLayout(this); pv.setOrientation(LinearLayout.VERTICAL);
+        pv.setPadding(dp(12), dp(4), dp(12), dp(4));
+        TextView msg = new TextView(this);
+        msg.setText("将整份 json (“" + recFieldOf(ff, "realName", ff.getName()) + "”)按原名恢复还是彻底删除？");
+        msg.setTextSize(13f); msg.setTextColor(0xFF333); pv.addView(msg);
+        android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
+            .setTitle("恢复 json 还是删除？").setView(pv).setCancelable(true).create();
+        LinearLayout btns = new LinearLayout(this); btns.setOrientation(LinearLayout.HORIZONTAL);
+        TextView bR = keyBtn("恢复", 0xFF2E9E5B); TextView bD = keyBtn("删除", 0xFFE05B4C);
+        bR.setOnClickListener(x -> { d.dismiss(); restoreJsonEntry(ff); rcJsonRefresh(); });
+        bD.setOnClickListener(x -> { d.dismiss();
+            new android.app.AlertDialog.Builder(this)
+                .setTitle("彻底删除该份 json？").setMessage("会把它从回收站永久移除")
+                .setPositiveButton("删除", (y, z) -> { deleteDirRec(ff); toast("已删除"); rcJsonRefresh(); })
+                .setNegativeButton("取消", null).show();
+        });
+        btns.addView(bR, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(dp(10), 1); btns.addView(new View(this), gap);
+        btns.addView(bD, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        pv.addView(btns);
+        d.show();
+    }
+    private void restoreJsonEntry(java.io.File ff) {
+        try {
+            JSONObject j = new JSONObject(readAll(ff));
+            String realName = j.optString("realName", "restored.json");
+            String bid = j.optString("branch", "");
+            JSONObject data = j.optJSONObject("data");
+            if (data == null) { toast("该份 json 无内容"); return; }
+            java.io.File src = new java.io.File(rootDir, bid);
+            Branch dest = null;
+            for (Branch b : repos.all()) if (b.id.equals(bid)) { dest = b; break; }
+            boolean missing = dest == null || !src.isDirectory();
+            if (missing) { recreateBranchedForJson(j.optString("branchTitle", "restored"), realName, data); deleteDirRec(ff); return; }
+            java.io.File tgt = new java.io.File(new java.io.File(rootDir, dest.id), realName.endsWith(".json") ? realName : realName + ".json");
+            writeJsonAstex(tgt, data.toString(2));
+            deleteDirRec(ff);
+            repos.initializeFromLocal(rootDir); refreshDrawerList();
+            toast("已把 " + realName + " 恢复回 " + dest.title);
+        } catch (Exception e) { toast("恢复失败：" + (e.getMessage() == null ? e.toString() : e.getMessage())); }
+    }
+    private void recreateBranchedForJson(String brTitle, String realName, JSONObject data) {
+        try {
+            String safe = brTitle == null || brTitle.trim().isEmpty() ? "restored" : brTitle.replaceAll("[\\\\/:*?\"<>|]+", "_");
+            // 与 key/块 一致：同主合并 —— 已有 re-<title> 目录则复用，不额外 _1;文件仍按原文件名放(同档覆盖，不同名共存)
+            java.io.File dirB = new java.io.File(rootDir, "re-" + safe);
+            if (!dirB.exists()) dirB.mkdirs();
+            java.io.File tgt = new java.io.File(dirB, realName.endsWith(".json") ? realName : realName + ".json");
+            writeJsonAstex(tgt, data.toString(2));
+            repos.initializeFromLocal(rootDir); refreshDrawerList();
+            toast("已并入 re-" + safe + "，放回 " + realName);
+        } catch (Exception e) { toast("兜底失败"); }
+    }
+    /** 分支面板：与 json/子项一致 圆角卡片，单击卡片 → 在“恢复/删除”小窗里选；不再走老平铺+行内钮 */
+    /** 分支原显示名：从 .index.json 里按夹名该行登记的 branch/srcPath 取“删前名称”；旧数据无 则退回夹内哈希名。 */
+    private String branchDisplayName(java.io.File f) {
+        String name = f.getName();
+        try {
+            JSONArray a = idxLoad();
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i); if (o == null) continue;
+                if ("branches".equals(o.optString("kind")) && name.equals(o.optString("file"))) {
+                    String s = o.optString("srcPath", "");
+                    if (s.trim().length() > 0) return s.trim();
+                }
+            }
+        } catch (Exception ignored) { }
+        return name;
+    }
+    private void openRecycleBranches(final String title) {
+        rcBraDlg = new android.app.AlertDialog.Builder(this).setTitle(null).create();
+        LinearLayout body = buildBranchList(title);
+        if (body == null) { try { rcBraDlg.dismiss(); } catch (Exception ignored) { } rcBraDlg = null; showEmptyKinPanel(title, "分支回收夹"); return; }
+        android.widget.ScrollView sv2 = new android.widget.ScrollView(this);
+        sv2.addView(body, new android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(6),dp(6),dp(6),dp(2));
+        int bb = (rcFolder("branches").listFiles()==null?0:rcFolder("branches").listFiles().length);
+        TextView head = new TextView(this); head.setText(title + " · " + bb + " 份 · 源" + idxSrcCount("branches"));
+        head.setTextColor(0xFF252833); head.setTextSize(16f); head.setTypeface(Typeface.DEFAULT_BOLD); box.addView(head);
+        box.addView(sv2, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,0,1f));
+        rcBraDlg.setView(box);
+        rcBraDlg.setButton(android.content.DialogInterface.BUTTON_NEUTRAL, "清空此类", (d,w)->{
+            try { for (java.io.File g : rcFolder("branches").listFiles()) if (g != null && g.exists()) deleteDirRec(g); } catch (Exception ignored) { }
+            toast(title + " 回收夹已清空"); rcBraRefresh();
+        });
+        rcBraDlg.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "返回", (d,w)->{ try { rcBraDlg.dismiss(); } catch (Exception ignored) { } rcBraDlg=null; });
+        rcBraDlg.show();
+    }
+    /** 分支列表主体；空返回 null（走空态页）。列表项显示“删前名称”。 */
+    private LinearLayout buildBranchList(final String title) {
+        java.io.File dir = rcFolder("branches");
+        java.io.File[] items = dir.listFiles();
+        if (items == null || items.length == 0) return null;
+        LinearLayout inner = new LinearLayout(this); inner.setOrientation(LinearLayout.VERTICAL);
+        for (java.io.File f : items) {
+            final java.io.File ff = f;
+            final String dsp = branchDisplayName(f);   // 删前名称
+            LinearLayout card = new LinearLayout(this); card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(dp(7),dp(4),dp(7),dp(4));
+            android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
+            gd.setColor(0xFFF4F6FC); gd.setCornerRadius(dp(9)); gd.setStroke(dp(1),0x2F000000); card.setBackground(gd);
+            TextView a0 = new TextView(this); a0.setText("分支：" + dsp);
+            a0.setTextSize(13f); a0.setTextColor(0xFF33363E); a0.setPadding(dp(2),dp(1),dp(2),dp(1)); card.addView(a0);
+            TextView a1 = new TextView(this); a1.setText(dirLen(ff) == 0 ? "空分支" : ("含 " + fSized(ff)));
+            a1.setTextSize(11f); a1.setTextColor(0xFF8A919C); a1.setPadding(dp(2),dp(1),dp(2),dp(1)); card.addView(a1);
+            card.setOnClickListener(v -> askBranchEntry(ff, dsp, title));
+            inner.addView(card); inner.addView(UiKit.spacer(MainActivity.this,2));
+        }
+        return inner;
+    }
+    /** 分支动作后刷新：若分支页在显示则先关旧、再开新版。 */
+    private void rcBraRefresh() {
+        if (rcBraDlg != null) { try { rcBraDlg.dismiss(); } catch (Exception ignored) { } rcBraDlg = null; }
+        openRecycleBranches("分支");
+    }
+    private void askBranchEntry(final java.io.File ff, final String dsp, final String title) {
+        LinearLayout pv = new LinearLayout(this); pv.setOrientation(LinearLayout.VERTICAL); pv.setPadding(dp(12),dp(4),dp(12),dp(4));
+        TextView msg = new TextView(this); msg.setText("分支 “" + dsp + "” 整夹恢复，还是彻底删除？");
+        msg.setTextSize(13f); msg.setTextColor(0xFF333); pv.addView(msg);
+        android.app.AlertDialog d = new android.app.AlertDialog.Builder(this).setTitle("恢复还是删除？").setView(pv).setCancelable(true).create();
+        LinearLayout btns = new LinearLayout(this); btns.setOrientation(LinearLayout.HORIZONTAL);
+        TextView bR = keyBtn("恢复",0xFF2E9E5B); TextView bD = keyBtn("删除",0xFFE05B4C);
+        bR.setOnClickListener(x -> { d.dismiss(); restoreBranchArc(ff);
+            rcBraRefresh();
+        });
+        bD.setOnClickListener(x -> { d.dismiss();
+            new android.app.AlertDialog.Builder(this).setTitle("彻底删除该分支？")
+                .setMessage("会把它从回收站永久移除，无法再恢复。")
+                .setPositiveButton("删除",(y,z)->{ if (ff.exists()) deleteDirRec(ff); toast("已删除"); rcBraRefresh(); })  // 删除后立刻刷新分支页
+                .setNegativeButton("取消",null).show();
+        });
+        btns.addView(bR,new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
+        android.view.View sp = new android.view.View(this); sp.setLayoutParams(new LinearLayout.LayoutParams(dp(10),1));
+        btns.addView(sp);
+        btns.addView(bD,new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
+        pv.addView(btns); d.show();
+    }
+    private void openRecycleList(String kind, String title) {
+        // 四个 kind 全部走同一套 key/块已验证的持久面板(rcSubDlg/refreshKeyList)：子项/块照旧，json/分支按各自记录渲染并复用同一弹窗逻辑
+        rcKind = kind; openKeyPanel(title); return;
+    }
+    private String fSized(java.io.File f) {
+        long s = 0;
+        s = f.isDirectory() ? dirLen(f) : f.length();
+        if (s < 1024) return s + " B";
+        if (s < 1048576) return (s / 1024) + " KB";
+        return (s / 1048576) + " MB";
+    }
+    private long dirLen(java.io.File f) {
+        long s = 0;
+        java.io.File[] c = f.listFiles();
+        if (c != null) for (java.io.File x : c) s += x.isDirectory() ? dirLen(x) : x.length();
+        return s;
+    }
+    // =============== “子项”(key) 回收清单：右上多选勾选框(外观) + 单击弹 恢复/删除 ===============
+    // ---- “子项”清单：用一个成员对话框；列表可原地即时刷新，不再重弹新窗 ----
+    private android.app.AlertDialog rcSubDlg;
+    private LinearLayout rcList;
+    // —— json 全档 / 分支整夹 的持久页(与 key/块共用 rcSubDlg 的“原地重绑”思路) ——
+    private android.app.AlertDialog rcJsonDlg; private LinearLayout rcBodyJson; private String rcJsonTitle;
+    private android.app.AlertDialog rcBraDlg; private LinearLayout rcBodyBra;
+
+    private TextView rcHead;
+    private android.widget.CheckBox rcMulti;
+    private String rcKind = "key";   // “子项”通用面板当前处理的 kind:key/block
+    private String rcTitle = "子项";
+
+    private void openKeyPanel(String title) {
+        rcTitle = title;
+        if (rcSubDlg == null) {
+            LinearLayout whole = new LinearLayout(this); whole.setOrientation(LinearLayout.VERTICAL);
+            whole.setPadding(dp(6), dp(6), dp(6), dp(2));
+            LinearLayout head = new LinearLayout(this); head.setOrientation(LinearLayout.HORIZONTAL);
+            rcHead = new TextView(this); rcHead.setTextColor(0xFF252833);
+            rcHead.setTextSize(16f); rcHead.setTypeface(Typeface.DEFAULT_BOLD);
+            head.addView(rcHead, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            rcMulti = new android.widget.CheckBox(this);
+            rcMulti.setText("多选模式"); rcMulti.setTextSize(13f);
+            head.addView(rcMulti);
+            whole.addView(head);
+            android.widget.ScrollView sv = new android.widget.ScrollView(this);
+            rcList = new LinearLayout(this); rcList.setOrientation(LinearLayout.VERTICAL);
+            sv.addView(rcList, new android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+            whole.addView(sv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+            rcSubDlg = new android.app.AlertDialog.Builder(this)
+                .setTitle(null).setView(whole).setNegativeButton("返回", null).create();
+            rcSubDlg.setOnShowListener(v -> rcHead.post(this::refreshKeyList));
+        }
+        rcHead.setText(rcTitle + " · " + (rcFolder(rcKind).listFiles() == null ? 0 : rcFolder(rcKind).listFiles().length) + " 份 · 源" + idxSrcCount(rcKind));
+        refreshKeyList();
+        if (!rcSubDlg.isShowing()) rcSubDlg.show();
+    }
+
+    private void refreshKeyList() {
+        if (rcList == null) return;
+        afterRecycleChange();                                       // 增删造成的重构建 → 立即同步 Board/设置等数字(见 #3)
+        java.io.File[] items = rcFolder(rcKind).listFiles();
+        rcList.removeAllViews();
+        if (items == null || items.length == 0) {
+            // 与 json/分支一致：占位灰字垂直居中、上下留大呼吸空间，视觉置于面板主体的中部
+            TextView empty = new TextView(this);
+            String noun = "block".equals(rcKind) ? "块" : ("branches".equals(rcKind) ? "分支" : ("json".equals(rcKind) ? "json" : "子项"));
+            empty.setText("（" + noun + "回收夹已空）");
+            empty.setTextColor(0xFF9AA0A6);
+            empty.setGravity(Gravity.CENTER);
+            empty.setTextSize(14f);
+            empty.setPadding(dp(0), dp(26), dp(0), dp(26));
+            rcList.addView(empty);
+            if (rcHead != null) rcHead.setText(rcTitle + " · 0 份 · 源" + idxSrcCount(rcKind));
+            return;
+        }
+        if (rcHead != null) rcHead.setText(rcTitle + " · " + items.length + " 份 · 源" + idxSrcCount(rcKind));
+        for (java.io.File f : items) {
+            final java.io.File ff = f;
+            LinearLayout card = new LinearLayout(this); card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(dp(7), dp(3), dp(7), dp(3));
+            android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
+            gd.setColor(0xFFF4F6FC); gd.setCornerRadius(dp(9)); gd.setStroke(dp(1), 0x2F000000);
+            card.setBackground(gd);
+            if ("branches".equals(rcKind)) {
+                // 分支整夹条目：显示删前名
+                addL(card, "分支", branchDisplayName(ff));
+                boolean has = (ff.listFiles() != null && ff.listFiles().length > 0);
+                addL(card, "内容", has ? (ff.listFiles().length + " 项") : "空分支");
+            } else if ("json".equals(rcKind)) {
+                addL(card, "分支", recFieldOf(ff, "branchTitle", "?"));
+                addL(card, "json", recFieldOf(ff, "realName", ff.getName()));
+            } else if ("block".equals(rcKind)) {
+                String[] ib = parseKeyLayout(readOrigOf(ff));
+                addL(card, "分支", ib[0]); addL(card, "json", ib[1]); addL(card, "块", ib[3]);
+            } else {
+                String[] ik = parseKeyLayout(readOrigOf(ff));
+                addL(card, "分支", ik[0]); addL(card, "json", ik[1]); addL(card, "块", ik[2]); addL(card, "key", ik[3]);
+            }
+            card.setOnClickListener(v -> {
+                if (rcMulti != null && rcMulti.isChecked()) { toast("多选模式已勾选，多选删除待接入"); return; }
+                askEntryKind(rcKind, ff);
+            });
+            rcList.addView(card);
+            rcList.addView(UiKit.spacer(MainActivity.this, 2));
+        }
+    }
+    /** 统一入口：key/块沿用原 askKeyEntry；json/分支在此以同款“恢复/删除”处理并回顾面刷新。 */
+    private void askEntryKind(String kind, final java.io.File ff) {
+        if ("key".equals(kind) || "block".equals(kind)) { askKeyEntry(ff); return; }
+        if ("json".equals(kind)) { askJsonWhole(ff); return; }
+        if ("branches".equals(kind)) { askBranchWhole(ff); }
+    }
+    /** json 整份条目操作(在该持久页内)：恢复 / 删除二次确认后都 refreshKeyList。 */
+    private void askJsonWhole(final java.io.File ff) {
+        final String nm = recFieldOf(ff, "realName", ff.getName());
+            // 恢复/删除 左右互换 + 后续删除二次确认
+            android.app.AlertDialog _a = new android.app.AlertDialog.Builder(this)
+            .setTitle("该 json 整份：" + nm)
+            .setMessage("恢复(回原分支/原文件名)还是彻底删除？").create();
+            _a.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "删除", (d, w) -> {
+                d.dismiss();
+                new android.app.AlertDialog.Builder(this).setTitle("彻底删除该份 json？")
+                    .setMessage("会把它从回收站永久移除。")
+                    .setPositiveButton("删除", (y, z) -> { if (ff.exists()) deleteDirRec(ff); toast("已删除"); refreshKeyList(); })
+                    .setNegativeButton("恢复", (y, z) -> { /* 免误点逃生 */ })
+                    .setNeutralButton("取消", null).show();
+            });
+            _a.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "恢复", (d, w) -> { d.dismiss(); restoreJsonEntry(ff); refreshKeyList(); });
+            _a.show();
+            return;
+    }
+    /** 分支整夹条目操作：同上，恢复以原可读名回 re- 分支。 */
+    private void askBranchWhole(final java.io.File ff) {
+        final String nm = branchDisplayName(ff);
+    // 恢复/删除 左右互换：删除在右为主钮(仍二次确认)，恢复在左为次钮
+    final String bnm = nm;
+    android.app.AlertDialog _b = new android.app.AlertDialog.Builder(this)
+        .setTitle("分支：" + bnm)
+        .setMessage("恢复(回 re- 分支)还是彻底删除？").create();
+    _b.setButton(android.content.DialogInterface.BUTTON_POSITIVE, "删除", (d, w) -> {
+        d.dismiss();
+        new android.app.AlertDialog.Builder(this).setTitle("彻底删除该分支？")
+            .setMessage("会把它从回收站永久移除。")
+            .setPositiveButton("删除", (y, z) -> { if (ff.exists()) deleteDirRec(ff); toast("已删除"); refreshKeyList(); })
+            .setNegativeButton("恢复", (y, z) -> { })   // 逃生：回到上一级
+            .setNeutralButton("取消", null).show();
+    });
+    _b.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "恢复", (d, w) -> { d.dismiss(); restoreBranchArc(ff); refreshKeyList(); });
+    _b.show();
+    }
+    private void addL(LinearLayout c, String tag, String v0) {
+        String v = v0 == null ? "—" : v0;
+        TextView t = new TextView(this);
+        if (tag.equals("块") || tag.equals("key")) t.setText(v); else t.setText(tag + "：" + v);
+        t.setTextSize(13f); t.setTextColor(tag.equals("key") ? 0xFF1E66C2 : 0xFF33363E);
+        t.setPadding(dp(2), dp(1), dp(2), dp(1)); c.addView(t);
+    }
+    private String[] parseKeyLayout(String orig) {
+        String[] out = {"", "", "", ""};
+        if (orig == null) return out;
+        String head = orig, tail = "";
+        int dd = orig.indexOf("::");
+        if (dd >= 0) { head = orig.substring(0, dd); tail = orig.substring(dd + 2); }
+        String br = head, file = ""; int sl = head.indexOf('/');
+        if (sl >= 0) { br = head.substring(0, sl); file = head.substring(sl + 1); }
+        else { br = "?"; file = head; }
+        String chain = tail, lastK = "";
+        int dot = chain.lastIndexOf('.');
+        String cpre = "";
+        if (dot >= 0) { lastK = chain.substring(dot + 1); cpre = tail.substring(0, dot); }
+        else lastK = chain;
+        java.lang.StringBuilder blk = new java.lang.StringBuilder();
+        if (!cpre.isEmpty()) { String[] cp = cpre.split("\\.");
+            for (int i = 0; i < cp.length; i++) { if (i > 0) blk.append('.'); blk.append(cp[i]); } }
+        out[0] = br; out[1] = file; out[2] = blk.toString(); out[3] = lastK;
+        return out;
+    }
+    private void askKeyEntry(final java.io.File ff) {
+        String orig = readOrigOf(ff);
+        LinearLayout pv = new LinearLayout(this); pv.setOrientation(LinearLayout.VERTICAL);
+        pv.setPadding(dp(12), dp(4), dp(12), dp(4));
+        TextView padTop = new TextView(this); padTop.setHeight(dp(6)); pv.addView(padTop, 0);
+        TextView msg = new TextView(this); msg.setText("该子项：" + foldRecycleLabel(orig));
+        msg.setTextSize(13f); msg.setTextColor(0xFF333); pv.addView(msg);
+        android.app.AlertDialog d = new android.app.AlertDialog.Builder(this).setTitle("恢复还是删除？")
+            .setView(pv).setCancelable(true).create();
+        LinearLayout btns = new LinearLayout(this); btns.setOrientation(LinearLayout.HORIZONTAL);
+        TextView bR = keyBtn("恢复", 0xFF2E9E5B); TextView bD = keyBtn("删除", 0xFFE05B4C);
+        bR.setOnClickListener(x -> { d.dismiss(); restoreKeyEntry(ff); refreshKeyList(); });
+        bD.setOnClickListener(x -> { d.dismiss(); removeRecycleFile(ff); refreshKeyList(); });   // 不再二次“彻底删除该子项？”确认
+        btns.addView(bR, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(dp(10), 1); btns.addView(new View(this), gap);
+        btns.addView(bD, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        pv.addView(btns);
+        d.show();
+    }
+    private TextView keyBtn(String txt, int color) {
+        TextView t = new TextView(this); t.setText(txt);
+        t.setTextSize(16f); t.setTextColor(0xFFFFFFFF); t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(4), dp(12), dp(4), dp(12));
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setColor(color); g.setCornerRadius(dp(10)); t.setBackground(g);
+        return t;
+    }
+    private void removeRecycleFile(java.io.File f) { if (f.exists()) deleteDirRec(f); toast("已彻底删除该子项"); afterRecycleChange(); }
+
+    /** 恢复单条子项：原位置精确放回；缺失则兜底重建同名链，值回到其 key */
+    private void restoreKeyEntry(java.io.File ff) {
+        try {
+            String orig = readOrigOf(ff);
+            JSONObject data = readDataOf(ff);
+            if (data == null || orig == null) { toast("该份缺数据，无法恢复"); return; }
+            String kv = data.keys().next(); Object val = data.opt(kv);
+            // orig= 分支/文件::段1.段2.key
+            String brT = orig.substring(0, orig.indexOf('/'));
+            String rest = orig.substring(orig.indexOf('/') + 1);
+            String fileN = rest.substring(0, rest.indexOf("::"));
+            String chainK = rest.substring(rest.indexOf("::") + 2);
+            java.util.List<String> segs = new java.util.ArrayList<String>();
+            int dot = chainK.lastIndexOf('.');
+            String lastK = dot < 0 ? chainK : chainK.substring(dot + 1);
+            String chain = dot < 0 ? "" : chainK.substring(0, dot);
+            if (!chain.isEmpty()) for (String s : chain.split("\\.")) segs.add(s);
+
+            // 定位原分支
+            Branch dest = null;
+            for (Branch b : repos.all()) if ((b.title != null && b.title.equals(brT)) || b.id.equals(brT)) { dest = b; break; }
+            java.io.File dirB = dest != null ? new java.io.File(rootDir, dest.id) : null;
+            boolean missingBranch = dirB == null || !dirB.isDirectory();
+            java.io.File jf = null;
+            if (dirB != null) jf = new java.io.File(dirB, fileN.endsWith(".json") ? fileN : fileN + ".json");
+            if (missingBranch || jf == null || !jf.exists()) {
+                // 兜底：能否原位差一点→在新分支(或目录)补同名文件顶层链
+                recreateBranched(orig, segs, lastK, val, ff);
+                return;
+            }
+            // 文件存在：把 segs 链走到（缺则建对象壳），末尾放 lastK=val
+            JSONObject root;
+            try { root = new org.json.JSONObject(readAll(jf)); } catch (Exception e) { recreateBranched(orig, segs, lastK, val, ff); return; }
+            JSONObject cur = root;
+            boolean missing = false;
+            for (String s : segs) {
+                JSONObject nxt = cur.optJSONObject(s);
+                if (nxt == null) { nxt = new JSONObject(); missing = true; try { cur.put(s, nxt); } catch (Exception e) { } }
+                cur = nxt;
+            }
+            try { cur.put(lastK, val); } catch (Exception e) { }
+            // archive 壳(仅当根为单键“顶层”白名单)在落盘前剥掉，恢复以内容为根
+            JSONObject peeled = archivePeel(root);
+            writeJsonAstex(jf, (peeled != null ? peeled : root).toString(2));
+            removeRecycleFile(ff);
+            repos.initializeFromLocal(rootDir); refreshDrawerList();
+            refreshKeyList();
+            toast((missing ? "（上层原本缺失，已把缺层补齐并原位放回）" : "已原位恢复该子项 ") + lastK);
+        } catch (Exception e) { toast("恢复失败：" + (e.getMessage() == null ? e.toString() : e.getMessage())); }
+    }
+    private void recreateBranched(String orig, java.util.List<String> segs, String lastK, Object val, java.io.File ff) {
+        try {
+            String brT = orig.substring(0, orig.indexOf('/'));
+            String rest = orig.substring(orig.indexOf('/') + 1);
+            String fileN = rest.substring(0, rest.indexOf("::")) ;
+            // 良好命名：来自原分支标题/原文件名，重名 re 目录_1/_2…；文件名保留原名
+            String safe = brT == null || brT.trim().isEmpty() ? "restored"
+                    : brT.replaceAll("[\\\\/:*?\"<>|\\s]+", "_");
+            java.io.File dirB = new java.io.File(rootDir, "re-" + safe);
+            int _k = 0; while (dirB.exists() && !dirB.isDirectory()) dirB = new java.io.File(rootDir, "re-" + safe + "_" + (++_k));
+            if (!dirB.exists()) dirB.mkdirs();
+            String jname = fileN.endsWith(".json") ? fileN : fileN + ".json";
+            java.io.File jf = new java.io.File(dirB, jname);
+
+            // 同主合并：同一 re 分支里已有同名 json → 并入那棵树(同父同 key 后到覆盖先到)，不同 key/不同父自然共存；缺文件/缺分支才新建
+            JSONObject root;
+            if (jf.exists()) {
+                try { root = new JSONObject(readAll(jf)); }
+                catch (Exception e) { root = new JSONObject(); }
+            } else root = new JSONObject();
+
+            // 先解 archive 壳再并：同类文件(带“顶层”壳)不因合并多套一层
+            JSONObject peeled = archivePeel(root);
+            JSONObject headR = peeled != null ? peeled : root;
+
+            JSONObject cur = headR;
+            // segs 若是空就表示直接放根级
+            if (segs != null) {
+                for (String s : segs) {
+                    JSONObject nxt = cur.optJSONObject(s);
+                    if (nxt == null) { nxt = new JSONObject(); try { cur.put(s, nxt); } catch (Exception e) { } }
+                    cur = nxt;
+                }
+            }
+            try { cur.put(lastK, val == null ? "" : val); } catch (Exception e) { }
+
+            // 合入的是已去壳内容：写回时不再带壳
+            writeJsonAstex(jf, headR.toString(2));
+            removeRecycleFile(ff);
+            repos.initializeFromLocal(rootDir); refreshDrawerList();
+            refreshKeyList();
+            toast("已并入 re-" + safe + "/" + jname);
+        } catch (Exception e) { toast("兜底失败"); }
+    }
+    private void writeJsonAstex(java.io.File f, String txt) {
+        try { java.io.FileOutputStream o = new java.io.FileOutputStream(f); o.write(txt.getBytes("UTF-8")); o.close(); }
+        catch (Exception e) { toast("写文件失败"); }
+    }
+    private String readOrigOf(java.io.File f) {
+        try { if (f.isDirectory()) return f.getName();
+            JSONObject j = new JSONObject(readAll(f)); return j.optString("orig", f.getName()); }
+        catch (Exception e) { return f.getName(); }
+    }
+    private JSONObject readDataOf(java.io.File f) {
+        try { JSONObject j = new JSONObject(readAll(f)); Object d = j.opt("data");
+            return d instanceof JSONObject ? (JSONObject) d : null; } catch (Exception e) { return null; }
+    }
+    private String foldRecycleLabel(String orig) {
+        if (orig == null) return "";
+        String[] outer = orig.split("::", 2);
+        String head = outer.length > 0 ? outer[0] : "";
+        String tail = outer.length > 1 ? outer[1] : orig;
+        java.util.List<String> pieces = new java.util.ArrayList<String>();
+        for (String s : head.split("/")) if (!s.isEmpty()) pieces.add(s);
+        String chain = tail; int dot = chain.lastIndexOf('.'); String key3;
+        String cpre = dot < 0 ? "" : chain.substring(0, dot);
+        key3 = dot < 0 ? chain : chain.substring(dot + 1);
+        if (!cpre.isEmpty()) { for (String s : cpre.split("\\.")) if (!s.isEmpty()) pieces.add(s); }
+        pieces.add(key3);
+        String joined = "";
+        for (String p : pieces) {
+            String j = p;
+            if (j.toLowerCase().endsWith(".json")) j = j.substring(0, j.length() - 5);
+            joined += (joined.isEmpty() ? "" : "-") + clip3(j);
+        }
+        return joined;
+    }
+    private String clip3(String s) { if (s == null) return ""; StringBuilder b = new StringBuilder(); int c = 0;
+        for (int i = 0; i < s.length() && c < 3; i++) { b.append(s.charAt(i)); c++; } return b.toString(); }
+    /** 归一外壳名：去掉 JSON 转义的 \/ 及反斜杠、C 风格首尾空格后用它判断白名单 */
+    private String normShellKey(String s) {
+        if (s == null) return "";
+        String out = s.replace("\\/", "").replace("\\", "").replace("/", "").trim();
+        return out;
+    }
+    /** 是否标 archive 壳：根只单键、且键名归一 == “顶层”。若是返回其唯一内容对象，否则返回 null */
+    private JSONObject archivePeel(JSONObject root) {
+        if (root == null || root.length() != 1) return null;
+        try {
+            java.util.Iterator<String> it = root.keys();
+            String k = it.hasNext() ? it.next() : null;
+            if (normShellKey(k).equals("顶层")) {
+                Object o = root.opt(k);
+                if (o instanceof JSONObject) return (JSONObject) o;
+            }
+        } catch (Exception e) { }
+        return null;
+    }
+    private void copyRec(java.io.File src, java.io.File dst) {
+        try {
+            if (src.isDirectory()) { dst.mkdirs(); java.io.File[] c = src.listFiles(); if (c != null) for (java.io.File x : c) copyRec(x, new java.io.File(dst, x.getName())); }
+            else { java.io.FileInputStream i = new java.io.FileInputStream(src); java.io.FileOutputStream o = new java.io.FileOutputStream(dst); byte[] b = new byte[8192]; int n; while ((n = i.read(b)) > 0) o.write(b, 0, n); i.close(); o.close(); }
+        } catch (Exception ignored) {}
+    }
+    /** 直接跳到某条删除记录所在层并高亮该 key(类似 jumpByHistory 但对 seg)。 */
+    private void markDelSaved(java.util.List<String> seg, String key) {
+        java.util.List<String> cs = new java.util.ArrayList<>(seg);
+        for (DelRec d : dels) if (d.file.equals(openName) && !d.saved && sameSeg(d.seg, cs) && d.key.equals(key)) {
+            d.saved = true; break;
+        }
+    }
+    /** 打开”基于 file 名在 currentBranch 里切换“（供删除记录跳/恢复用）。返回 tree、null 表示失败。 */
+    /** 现场恢复“回收站关闭&真删&同会话”删除记录：改在保留当前编辑缓存的中间态恢复(绝不重载磁盘丢未保存编辑)。 */
+    private void recoverDel(DelRec d) {
+        String snap = d.snap;
+        if (tree == null) return;
+        if (!openName.equals(d.file)) { toast("请先切到 "+d.file+" 所在文件再恢复(避免丢当前未保存编辑)"); return; }
+        JSONObject cont = tree.containerAt(new java.util.ArrayList<>(d.seg));
+        if (cont == null) { toast("该容器当前不存在(可能已整块被删)，无法现场恢复"); return; }
+        Object v;
+        try {
+            if (snap.trim().startsWith("{") || snap.trim().startsWith("[") || snap.trim().equals("null") || snap.trim().equals("true") || snap.trim().equals("false") || snap.trim().matches("-?\\d+(\\.\\d+)?")) {
+                v = new org.json.JSONTokener(snap).nextValue();
+            } else v = snap;
+        } catch (Exception e1) { v = snap; }
+        try { cont.put(d.key, v); tree.forceDirty(); } catch (Exception e2) { toast("恢复失败：" + e2.getMessage()); return; }
+        dels.remove(d);
+        hlSegs = new java.util.ArrayList<>(d.seg); hlKey = d.key;
+        path.clear(); path.addAll(d.seg); renderContainer();
+        toast("已把 items: "+ d.key +" 现场恢复回原位(可继续编辑/保存)");
+    }
+
+
     private static final int REQ_PICK_DIR = 1001;
     private static final int REQ_PICK_BG   = 1002;   // 设置里选背景图
     private static final int REQ_IMPORT_FOLDER = 1003;  // 导入文件夹(批量拷 json 入当前草稿分支)
@@ -211,8 +1129,11 @@ public class MainActivity extends Activity {
         // 搜索按钮(放大镜)：独立弹出搜索
         btnSearch.setOnClickListener(v -> openSearchDialog());
 
-        // 保存记录按钮(搜索左侧)：先首次告知，之后进入“过往保存”查看
-        btnSaveHistory.setOnClickListener(v -> openHistoryEntry());
+        // 保存记录按钮(搜索左侧)：
+        //   · 短按(及时松开) = 单击：立即进入“过往保存”查看；
+        //   · 按住达到阈时长(holdMs,下方常量)即自动回跳到最近保存点，不依赖松开(长按执行跳转)，
+        //     长按达成后那次触摸的抬起不会误开记录页；短按不足阈值则当单击用。
+        attachHistoryBtn();
 
         try {
             applySkinColors();
@@ -220,6 +1141,7 @@ public class MainActivity extends Activity {
             refreshDrawerList();
             refreshSaveButton();
             renderWelcome();
+            wsBufHandler.postDelayed(() -> offerRecoveryIfAny(), 600);   // 上次未保存草稿找回提示
         } catch (Throwable e) {
             // 崩在启动路径：把信息写到顶栏 title 便于用户/日志一眼定位(此环境无 adb)。
             String m = String.valueOf(e);
@@ -230,7 +1152,49 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 首屏引导：居中的圆角空态卡(A：精致空态)。 */
+    /** 记录按钮手下计时逻辑：短按(及时松)= 单击开记录页；按住达到阈值立即自动回跳(不等松手)。 */
+    private void attachHistoryBtn() {
+        final long hold = 480;                       // “长按最短判定时长”，到点即自动跳(可调)
+        final boolean[] fired = {false};
+        final Handler hh = new Handler(Looper.getMainLooper());
+        final Runnable jump = new Runnable() {
+            @Override public void run() {
+                if (fired[0]) return;                 // 已是长按跳了，忽略后续到点
+                fired[0] = true;
+                java.util.List<HistoryLog.Entry> all = HistoryLog.all();
+                if (all == null || all.isEmpty()) { toast("还没有已保存的最新修改可回跳"); return; }
+                HistoryLog.Entry lastEntry = all.get(all.size() - 1);
+                toast("回跳最近保存点：" + lastEntry.file + " / " + lastEntry.key);
+                try { jumpByHistory(lastEntry); } catch (Exception e) { toast("回跳失败：" + e.getMessage()); }
+            }
+        };
+        btnSaveHistory.setOnTouchListener((v, e) -> {
+            switch (e.getActionMasked()) {
+                case android.view.MotionEvent.ACTION_DOWN:
+                    fired[0] = false;
+                    hh.postDelayed(jump, hold);
+                    return true;
+                case android.view.MotionEvent.ACTION_UP:
+                    hh.removeCallbacks(jump);
+                    if (!fired[0]) openHistoryEntry();     // 短按(少于阈值)当单击 → 立即开记录页
+                    return true;
+                case android.view.MotionEvent.ACTION_CANCEL:
+                    hh.removeCallbacks(jump);
+                    return true;
+                default:
+                    return true;
+            }
+        });
+    }
+
+    /** 长按垃圾桶“取消待删”后小幅重画当前列表(保持所处分支不会切走)。 */
+    private void reRenderRowList() {
+        if (tree == null) return;
+        renderContainer();
+    }
+
+    /** 下拉刷新=只把当前这个 ListView 的数据重映射一份(不重建整页/不清标题、避免“闪”)。 */
+
     /** 重建抽屉数据并重画(新建分支后调用)。 */
     private void refreshDrawerList() {
         restorePinnedIfNeeded();               // 首次重建前把上次置顶集合读回来(持久)
@@ -427,6 +1391,7 @@ public class MainActivity extends Activity {
             pinnedBranchIds.remove(br.id); if (pinnedBranchIds.contains(br.id)) pinnedBranchIds.remove(br.id);
             pinnedBranchIds.add(nl);
             repos.initializeFromLocal(rootDir);
+            pendingBranchRekey(String.valueOf(br.id), nl);    // 阶段4:分支改名后把其未保存暂存改挂到新 id,不丢
             refreshDrawerList();
             dlg.dismiss(); toast("已重命名");
         }));
@@ -440,12 +1405,21 @@ public class MainActivity extends Activity {
                 .setPositiveButton("删除", (d, w) -> {
                     ensureFavsLoaded();              // 先把两套收藏读进内存，删除后才能安全 prune(避免空盘误写)
                     pinnedBranchIds.remove(br.id);
-                    java.io.File f = new java.io.File(rootDir, br.id);
-                    deleteDirRec(f);
+                    java.io.File fromB = new java.io.File(rootDir, br.id);
+                    recycleBranchFs(fromB, br.title);   // 回收站开 = 先把整个分支夹副本收进 recycle/branches/
+                    deleteDirRec(fromB);
                     repos.initializeFromLocal(rootDir);
                     pruneOrphans();                  // 现在 br 已不在存活分支里 → 它名下收藏(含历史残留)一并清掉并写回
                     refreshDrawerList();
                     refreshSaveButton();
+                    // 若正停留在被删的这个分支里 → 清空会话并回到引导首页，避免停留/重进残留空壳
+                    if (currentBranch != null && currentBranch.id != null && currentBranch.id.equals(br.id)) {
+                        currentBranch = null; tree = null; openName = null;
+                        try { path.clear(); } catch (Exception ignore) {}
+                        clearWsBuf();                      // 该分支已入回收站: 清掉它那份 .buf,避免死分支占灯
+                        renderWelcome();
+                        refreshSaveButton();               // 死了的分支不再计灯(其待删暂存仍留在 pending 供恢复)
+                    }
                     toast("已删除分支及其收藏");
                 })
                 .setNegativeButton("取消", null)
@@ -457,6 +1431,56 @@ public class MainActivity extends Activity {
         if (f.isDirectory()) { java.io.File[] c = f.listFiles(); if (c != null) for (java.io.File x : c) deleteDirRec(x); }
         f.delete();
     }
+    private void copyDirRec(java.io.File src, java.io.File dst) throws Exception {
+        if (src.isDirectory()) {
+            dst.mkdirs();
+            java.io.File[] c = src.listFiles();
+            if (c == null) return;
+            for (java.io.File x : c) copyDirRec(x, new java.io.File(dst, x.getName()));
+        } else {
+            try (java.io.FileInputStream in = new java.io.FileInputStream(src);
+                 java.io.FileOutputStream out = new java.io.FileOutputStream(dst)) {
+                byte[] b = new byte[65536]; int n;
+                while ((n = in.read(b)) != -1) out.write(b, 0, n);
+            }
+        }
+    }
+    /** 分支整夹恢复：以 re-<原文件夹名> 拷回 rootDir(不覆盖现存分支)，再统一重扫。 */
+    private void restoreBranchArc(java.io.File ff) {
+        try {
+            // 分支恢复要用“原可读名”，不再用回收夹哈希名：据 name/file 查 .index.json 里该夹登记的 srcPath(原分支可读名)
+            String name = ff.getName();
+            String readable = null;
+            try {
+                JSONArray a = idxLoad();
+                for (int i = 0; i < a.length(); i++) {
+                    JSONObject o = a.optJSONObject(i); if (o == null) continue;
+                    if ("branches".equals(o.optString("kind")) && name.equals(o.optString("file"))) {
+                        String sp = o.optString("srcPath", "");
+                        if (sp.trim().length() > 0) readable = sp;
+                        break;
+                    }
+                }
+            } catch (Exception ignored) { }
+            if (readable == null) readable = name;         // 旧数据没登记时退回夹内名
+            String safe = brSlug(readable);
+            java.io.File dirB = new java.io.File(rootDir, "re-" + safe);
+            int k = 0; while (dirB.exists()) dirB = new java.io.File(rootDir, "re-" + safe + "_" + (++k));
+            // 恢复时把原分支名下未保存暂存改挂到新建 re- 分支(原分支id以 recycle 里 _srcid 为准,缺失才回退文件名)
+            String oldId = null;
+            try { java.io.File sidf = new java.io.File(ff, "_srcid"); if (sidf.exists()) oldId = readAll(sidf).trim(); } catch (Exception ignore) { }
+            if (oldId == null || oldId.isEmpty()) oldId = safe;
+            if (!oldId.isEmpty()) pendingBranchRekey(oldId, dirB.getName());
+            // 分支整夹本来就指向一个完整 json 集目录：把内容直接拷进 re 分支，无需再嵌套一格
+            copyDirRec(ff, dirB);
+            try { java.io.File mf = new java.io.File(dirB, "_srcid"); if (mf.exists()) mf.delete(); } catch (Exception ignore) {}
+            deleteDirRec(ff);
+            repos.initializeFromLocal(rootDir); refreshDrawerList();
+            refreshDoneOrWelcomeIfNeeded();
+            toast("已恢复分支为 re-" + safe);
+        } catch (Exception e) { toast("恢复分支失败"); }
+    }
+    private void refreshDoneOrWelcomeIfNeeded() { if (atWelcomePage) renderWelcome(); }
     private static String brSlug(String s) {
         String out = s.trim().replaceAll("[\\\\/:*?\"<>|\\s]+", "_");
         return out.isEmpty() ? "branch" : out;
@@ -464,6 +1488,7 @@ public class MainActivity extends Activity {
 
     private void renderWelcome() {
         atWelcomePage = true;                 // 本页即“未选仓库”引导首页：返回到此为止
+        title.setText(getString(R.string.app_name));   // 顶部标题回主页时刷回软件名(修复残留旧"分支/文件")
         LinearLayout wrap = new LinearLayout(this);
         wrap.setOrientation(LinearLayout.VERTICAL);
         wrap.setGravity(Gravity.CENTER);
@@ -642,8 +1667,6 @@ public class MainActivity extends Activity {
     }
 
     /** 当前 B 设计每行自己管理开合；此处为空实现仅供长按统一收回占位。 */
-    private void closeAllSwipeCells() { }
-
     // ==================== ★ 新收藏 / 动作窗 ====================
 
     /** key 长按动作窗：⭐收藏/取消收藏 + 🗑删除，占一行各半宽；右下角 取消。 */
@@ -697,10 +1720,16 @@ public class MainActivity extends Activity {
             if (f.key.equals(key) && f.file.equals(openName) && sameSeg(f.parent, parent)) return true;
         return false;
     }
+    /** 行内判断“是否收藏”加“以现存为准”：父容器此刻没有该 key(已被真删/移走)，或正待删，都视为未收藏。 */
+    private boolean isFavedLive(List<String> parent, String key) {
+        if (tree == null) return isFaved(parent, key);
+        JSONObject cont = tree.containerAt(parent);
+        if (cont == null || !cont.has(key)) return false;      // 已经不存在的目标 → 不显示星/不作为收藏判定
+        if (tree.isPendingDel(parent, key)) return false;      // 待删也不当作“仍收藏”
+        return isFaved(parent, key);
+    }
 
     /** 定位到 container 对应的 JSONObject；当前给出的即当前容器(不做重解析,保留引用)。 */
-    private JSONObject thisContainerFor(List<String> segs, JSONObject current) { return current; }
-
     /** 如本 key 已在收藏则移除(取消收藏)，否则加入。 */
     private void toggleFavorite(List<String> parentSegs, String key, Branch br) {
         boolean rm = false;
@@ -767,22 +1796,16 @@ public class MainActivity extends Activity {
         for (int i = 0; i < a.size(); i++) if (!a.get(i).equals(b.get(i))) return false;
         return true;
     }
-    private static boolean sameStr(String a, String b) { return a.equals(b); }
-
     /** 删除前统一弹“确定？”(简单、一视同仁，不因叶子就直删)。删后同步清收藏。 */
+    /** 单击“删除”即进入“待删除”，不再二次确认。只记录不真删,名称后紧贴垃圾桶(=可长按反悔);点总保存才真删。 */
     private void confirmUnifiedDelete(JSONObject container, String key, boolean isObj) {
         final List<String> cur = new ArrayList<>(path);
-        new AlertDialog.Builder(this)
-                .setTitle("删除")
-                .setMessage("确定删除这个「" + key + "」" + (isObj ? "及其全部内容" : "") + " 吗？该操作不可撤销")
-                .setPositiveButton("删除", (d, w) -> {
-                    tree.deleteKey(container, key);
-                    removeFavs(cur, key);
-                    refreshSaveButton();
-                    renderContainer();
-                })
-                .setNegativeButton("取消", null)
-                .show();
+        tree.addPendingDel(cur, key);          // 软删：登记+置脏
+        logDel(cur, key, container);           // 记录页出现一条“删除型”(状态待删)
+        refreshSaveButton();
+        renderContainer();                      // 名称后垃圾桶出现即视觉反馈,不再额外 toast
+        // —— trace(只读) ——
+        toast("TRACE软删 seg=[" + java.util.Arrays.toString(cur.toArray()) + "] key=" + key);
     }
     private void removeFavs(List<String> parent, String key) {
         boolean touched = false;
@@ -961,7 +1984,10 @@ public class MainActivity extends Activity {
         hlFile = openName;
         hlSegs = new ArrayList<>(f.parent);
         hlKey = f.key;
-        renderContainer();                            // path=父层→容器含该 key 行(列表高亮/若键没了渲染后并不在，走下面检测)
+        renderContainer();                            // path=父层→容器含该 key 行
+        // 目标此刻必须仍在：不在了(此前真删/路径失效)→ 当场移除这条收藏，不给“点了跳走却没有”
+        JSONObject cc = (tree == null) ? null : tree.containerAt(new ArrayList<>(f.parent));
+        if (cc == null || !cc.has(f.key)) { dropFav(f); toast("该收藏目标已不存在，已从收藏移除。"); return; }
         toast("已直达收藏： " + f.key);
     }
 
@@ -1144,8 +2170,9 @@ public class MainActivity extends Activity {
         head.setPadding(dp(16), dp(14), dp(8), dp(14));
         head.setBackgroundColor(Skin.surfaceAlt(this));
         TextView ht = new TextView(this);
-        ht.setText("外观与皮肤");
+        ht.setText("设置");
         ht.setTextSize(17f);
+        ht.setOnLongClickListener(v -> { showRawEditor(); return true; });   // 长按顶部标题 → 打开原文·记事本
         ht.setTextColor(Skin.text(this));
         ht.setTypeface(null, Typeface.BOLD);
         LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -1196,6 +2223,36 @@ public class MainActivity extends Activity {
         body.addView(UiKit.settingRow(MainActivity.this,"颜色管理", "随机 / 莫奈 / 自定义", v -> openColorManager()));
         // ★ 收藏：长按某 key → ⭐收藏，这里点后可快速回到那行
         body.addView(UiKit.settingRow(MainActivity.this,"⭐ 收藏表", favs.isEmpty() ? "空" : favs.size() + " 条", v -> openFavoritesDialog()));
+
+        // ✅ 回收站现在单独起一段(UiKit.sectionLabel 独立标题)，不再跟在“UI 主色”标题的组里
+        body.addView(UiKit.sectionLabel(MainActivity.this, "回收站"));
+        // ★ 回收站：浅卡无强调色、右端留 ›；数字随 afterRecycleChange live
+        {
+            LinearLayout rc = new LinearLayout(this);
+            rc.setOrientation(LinearLayout.HORIZONTAL); rc.setGravity(Gravity.CENTER_VERTICAL);
+            TextView la = new TextView(this); la.setText("回收站");
+            la.setTextSize(15f);
+            rc.addView(la, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            rcSettingVal = new TextView(this); rcSettingVal.setText("已存 " + recycleCount());
+            rcSettingVal.setTextSize(13f);
+            rc.addView(rcSettingVal);
+            TextView ra = new TextView(this); ra.setText("  \u203A");
+            ra.setTextSize(16f);
+            rc.addView(ra);
+            rc.setOnClickListener(v -> openRecycleBoard());
+            rc.setClickable(true);
+            rc.setPadding(dp(8), dp(12), dp(8), dp(12));
+            android.graphics.drawable.GradientDrawable gg2 = new android.graphics.drawable.GradientDrawable();
+            gg2.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
+            gg2.setColor(Skin.cardFill(this));                    // 随主题(浅/深)自适应
+            gg2.setCornerRadius(dp(10));
+            rc.setBackground(gg2);
+            la.setTextColor(Skin.text(this));
+            rcSettingVal.setTextColor(Skin.subText(this));
+            ra.setTextColor(Skin.mutedText(this));
+            body.addView(rc);
+        }
+
 
         // 底部软件名-日期(两行居中)，用小 spacer 撑到底
         View spacer = new View(this);
@@ -1284,115 +2341,6 @@ public class MainActivity extends Activity {
     }
 
     /** 颜色条目行(左文案，右色块预览)。palette 决定点开可选的色板。 */
-    private LinearLayout colorRow(String label, int color, Skin.Chip[] palette, java.util.function.IntConsumer apply) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        TextView l = new TextView(this);
-        l.setText(label);
-        l.setTextSize(15f);
-        l.setTextColor(Skin.text(this));
-        row.addView(l, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        View dot = new View(this);
-        android.graphics.drawable.GradientDrawable dg = new android.graphics.drawable.GradientDrawable();
-        dg.setColor(color);
-        dg.setCornerRadius(dp(10));
-        dg.setStroke(dp(2), 0xFFFFFFFF);
-        dot.setBackground(dg);
-        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(28), dp(28));
-        dlp.setMargins(0, 0, dp(8), 0);
-        row.addView(dot, dlp);
-        TextView arrow = new TextView(this);
-        arrow.setText("›");
-        arrow.setTextSize(18f);
-        arrow.setTextColor(Skin.mutedText(this));
-        row.addView(arrow);
-        row.setOnClickListener(v -> pickColor(label, palette, color, apply));
-        row.setClickable(true);
-        row.setPadding(dp(8), dp(14), dp(8), dp(14));
-        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
-        bg.setColor(Skin.cardFill(this));
-        bg.setCornerRadius(dp(10));
-        row.setBackground(bg);
-        return row;
-    }
-
-    private void pickColor(String title, Skin.Chip[] palette, int current, java.util.function.IntConsumer apply) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(24), dp(8), dp(24), dp(8));
-
-        // 用 final 单元素数组持有 dialog 引用，供循环内即点即关
-        final android.app.AlertDialog[] dlgHolder = new android.app.AlertDialog[1];
-
-        // 预设色块列表
-        for (Skin.Chip chip : palette) {
-            LinearLayout item = new LinearLayout(this);
-            item.setOrientation(LinearLayout.HORIZONTAL);
-            item.setGravity(Gravity.CENTER_VERTICAL);
-            View sw = new View(this);
-            android.graphics.drawable.GradientDrawable sd = new android.graphics.drawable.GradientDrawable();
-            sd.setColor(chip.color);
-            sd.setCornerRadius(dp(8));
-            sw.setBackground(sd);
-            LinearLayout.LayoutParams swp = new LinearLayout.LayoutParams(dp(26), dp(26));
-            swp.setMargins(0, 0, dp(12), 0);
-            item.addView(sw, swp);
-            TextView name = new TextView(this);
-            name.setText(chip.label + (current == chip.color ? "  ✓" : ""));
-            name.setTextSize(15f);
-            name.setTextColor(current == chip.color ? Skin.accentObj(this) : Skin.text(this));
-            item.addView(name);
-            item.setClickable(true);
-            item.setOnClickListener(v -> {
-                if (dlgHolder[0] != null) dlgHolder[0].dismiss();
-                apply.accept(chip.color);
-            });
-            box.addView(item, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-        }
-
-        // 手动输入 hex：标签 + 输入框一行
-        LinearLayout manual = new LinearLayout(this);
-        manual.setOrientation(LinearLayout.HORIZONTAL);
-        manual.setGravity(Gravity.CENTER_VERTICAL);
-        TextView ml = new TextView(this);
-        ml.setText("自定义");
-        ml.setTextSize(15f);
-        ml.setTextColor(0xFF666666);
-        manual.addView(ml, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        final EditText hex = new EditText(this);
-        hex.setHint("#2C7BB6");
-        hex.setTextSize(14f);
-        LinearLayout.LayoutParams hexLp = new LinearLayout.LayoutParams(dp(150), LinearLayout.LayoutParams.WRAP_CONTENT);
-        hexLp.topMargin = dp(6);
-        manual.addView(hex, hexLp);
-        box.addView(manual, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
-            .setTitle(title)
-            .setView(box)
-            .setPositiveButton("应用", null)
-            .setNegativeButton("取消", null)
-            .create();
-        dlgHolder[0] = dlg;
-        dlg.setOnShowListener(d -> dlg.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
-            .setOnClickListener(v -> {
-                String h = hex.getText().toString().trim();
-                if (h.isEmpty()) { dlg.dismiss(); return; }
-                if (h.startsWith("#")) h = h.substring(1);
-                if (h.length() != 6) { toast("颜色需为 #RRGGBB 六位十六进制"); return; }
-                try {
-                    int parsed = (int) Long.parseLong(h, 16) | 0xFF000000;
-                    apply.accept(parsed);
-                    dlg.dismiss();
-                } catch (NumberFormatException e) {
-                    toast("颜色需为 #RRGGBB 六位十六进制");
-                }
-            }));
-        dlg.show();
-    }
 
     private void pickBackground() {
         Intent i = new Intent(Intent.ACTION_GET_CONTENT);
@@ -1766,10 +2714,6 @@ public class MainActivity extends Activity {
         return bos.toByteArray();
     }
 
-    private void startSafPick() {
-        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-        startActivityForResult(i, REQ_PICK_DIR);
-    }
 
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
@@ -1900,6 +2844,9 @@ public class MainActivity extends Activity {
 
     private void openFile(Branch br, String name) {
         atWelcomePage = false;            // 已进入某 json 工作区：系统返回应回到 renderWelcome 首页
+        checkpointSwitchIF(br, name);        // 从当前旧文件(不同名)切过来：先把那份脏树先落草稿，防整体丢失
+        if (autoReAdoptWs(br, name)) return; // 若这次是要回到“同分支同文件且刚才有未保存草稿”→ 自动接回，不再读磁盘
+        if (adoptPendingSlot(br, name)) return;   // 否则看该分支同文件是否留有 .ws/pending 快照(含软删标记)也接回
         String text;
         if (br.hasSaf()) {
             try { text = SafDir.readFile(this, br.safUri, name); }
@@ -1924,6 +2871,8 @@ public class MainActivity extends Activity {
     /** 渲染当前容器(顶层或 path 所指层)：key 列表 + 每层末尾「＋ 新建」。 */
     private void renderContainer() {
         if (tree == null) return;
+        if (tree.isDirty()) scheduleWsFlush();   // 未保存编辑 → 延迟写草稿防崩溃丢改动(仅在改脏后)
+
         JSONObject picked = tree.containerAt(path);
         if (picked == null) { toast("路径异常"); path.clear(); picked = tree.rootObject(); }
         final JSONObject container = picked;
@@ -1977,15 +2926,10 @@ public class MainActivity extends Activity {
         }
         // 每次重建完成后记录“当下列表”，供下次同深度重建时参照
         liveListLv = lv;
+        curLv = lv;                                    // 顶层/底“快滑”引用的当前容器
         // 用完后回收临时态(避免用户后续在不同层操作残留蓝色)
         hlFile = null; hlSegs = null; hlKey = null;
         lv.setOnItemClickListener((p, v, pos, id) -> {
-            // 先记住“此刻停在第几可见行”和被编辑的 key，保存后重建据此返回，避免回到页顶。
-            if (pos >= items.size()) {
-                saveKeepRow = Math.max(0, lv.getFirstVisiblePosition());
-                saveKeepKey = null;
-                promptAddKey(container); return;
-            }
             String key = items.get(pos).toString();
             if (tree.isObjectValue(container, key)) {
                 saveKeepRow = -1;                 // 换层：交给子层自己的首刷，不沿用叶子的保位
@@ -2008,10 +2952,8 @@ public class MainActivity extends Activity {
             }
             return true;
         });
-        wrap.addView(lv, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        // 底部提示当前路径
+        // ===== 底部固定两操作行(不盖条目：它们排在 ListView 区之下，不重叠任何行) =====
+        // 「📍 当前位置」还返回底部常驻(tap 滚到列表最底那些“＋newkey/末行”快速跳到)
         TextView crumb = new TextView(this);
         crumb.setTextSize(13f);
         crumb.setTextColor(Skin.mutedText(this));
@@ -2021,9 +2963,91 @@ public class MainActivity extends Activity {
         cg.setCornerRadius(dp(10));
         crumb.setBackground(cg);
         crumb.setText("📍 当前位置：" + joinPath(path));
+        crumb.setOnClickListener(v -> {
+            ListView ll = curLv != null ? curLv : liveListLv;
+            if (ll != null && ll.getAdapter() != null) fastSeekRow(ll, ll.getCount() - 1);
+        });
+        // 「＋ 新建 key」= 固定底部钮(位置 crumb 上方)；点它新建当前容器的 key，不必滑到列表底
+        TextView addKeyBtn = new TextView(this);
+        addKeyBtn.setTextSize(14f);
+        addKeyBtn.setTextColor(0xFF4CAF50);
+        addKeyBtn.setText("＋ 新建 key");
+        addKeyBtn.setGravity(Gravity.CENTER);
+        addKeyBtn.setPadding(dp(12), dp(10), dp(12), dp(6));
+        android.graphics.drawable.GradientDrawable addBg = new android.graphics.drawable.GradientDrawable();
+        addBg.setColor(0x1130A84C);
+        addBg.setCornerRadius(dp(10));
+        addKeyBtn.setBackground(addBg);
+        addKeyBtn.setOnClickListener(v -> {
+            if (tree == null) return;
+            JSONObject cont = tree.containerAt(path);
+            if (cont == null) { toast("当前位置不可新建(请到对象/数组块内)"); return; }
+            promptAddKey(cont);
+        });
+        // ===== 顶部“下拉=刷新”把手(自绘,去掉库自带 indicator 以防其溢出被列表盖住) =====
+        final TextView guide = new TextView(this);
+        guide.setTextSize(11f);
+        guide.setGravity(Gravity.CENTER);
+        guide.setPadding(0, dp(3), 0, dp(3));
+        guide.setTextColor(0xFF7FA6D9);
+        guide.setText("下拉刷新");
+        android.graphics.drawable.GradientDrawable barBg = new android.graphics.drawable.GradientDrawable();
+        barBg.setColor(Skin.crumbBg(this));
+        barBg.setCornerRadius(dp(12));
+        guide.setBackground(barBg);
+        guide.setOnTouchListener(new android.view.View.OnTouchListener() {
+            final int TRIG = (int)(dp(64));
+            int base = Integer.MIN_VALUE;
+            @Override public boolean onTouch(android.view.View v, android.view.MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case android.view.MotionEvent.ACTION_DOWN: base = (int)e.getRawY(); return true;
+                    case android.view.MotionEvent.ACTION_MOVE:
+                        if (base != Integer.MIN_VALUE && e.getRawY() - base > TRIG) {
+                            base = Integer.MIN_VALUE;
+                            guide.setText("正在刷新…");
+                            guide.postDelayed(() -> {  // 延迟半拍让“正在刷新”文本先上屏
+                                saveKeepRow = Math.max(0, lv.getFirstVisiblePosition());
+                                renderContainer();
+                            }, 80);
+                            return false;
+                        }
+                        return true;
+                    case android.view.MotionEvent.ACTION_UP:
+                    case android.view.MotionEvent.ACTION_CANCEL: base = Integer.MIN_VALUE; return true;
+                }
+                return true;
+            }
+        });
+        guide.setOnClickListener(v -> {
+            saveKeepRow = Math.max(0, lv.getFirstVisiblePosition());
+            renderContainer();
+        });
+
+        // ===== “包住列表”的 SwipeRefresh：圆画在 (它包裹的) 列表层之上，不会再跑到条目下面 =====
+        androidx.swiperefreshlayout.widget.SwipeRefreshLayout srlWrap = new androidx.swiperefreshlayout.widget.SwipeRefreshLayout(this);
+        srlWrap.setColorSchemeColors(0xFF448AFF, 0xFF26A69A);
+        srlWrap.setProgressBackgroundColorSchemeColor(0xFF11131E);
+        srlWrap.addView(lv, new android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+        srlWrap.setOnRefreshListener(() -> {
+            saveKeepRow = Math.max(0, lv.getFirstVisiblePosition());
+            renderContainer();
+            srlWrap.setRefreshing(false);
+        });
+
+        // wrap 纵向：顶部下拉把手(自绘行) / 包住列表的 srlWrap(占剩余) / 底部 ＋新建 / 📍位置
+        wrap.addView(guide, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
+        wrap.addView(srlWrap, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        wrap.addView(addKeyBtn, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         wrap.addView(crumb, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        // 点顶部“当前页名称”→ 用“快速滑动”滚到最顶
+        title.setOnClickListener(v -> { ListView ll = curLv; if (ll != null) fastSeekRow(ll, 0); });
         // 右缘可拖细滚动条(第三轮 B)：包一层舞台，滑块叠在列表右侧极少宽度。
         final ScrollThumb tbar = new ScrollThumb(this);
         final int listCount = items.size() + 1;      // 与 ContainerAdapter.count 一致(含单“新建”行)
@@ -2153,6 +3177,14 @@ public class MainActivity extends Activity {
                     }
                     String perr = JsonModel.validateValue(raw);
                     if (perr != null) { toast("占位符检查: " + perr); return; }
+                    // —— (A/B) 无实质改动就点保存 → 仅关弹窗(总保存不应因此点亮) ——
+                    String bDisp = (val == null || val instanceof JSONObject || val instanceof JSONArray)
+                            ? null : String.valueOf(val);
+                    boolean realChange = !nk.equals(key)
+                            || (originNull
+                                ? !(raw.trim().isEmpty() || "null".equalsIgnoreCase(raw.trim()))
+                                : !raw.equals(bDisp));
+                    if (!realChange) { dlg.dismiss(); refreshSaveButton(); renderContainer(); return; }
                     // 先改值，再改名(若变了)
                     String err = tree.setLeaf(container, key, raw);
                     if (err != null) { toast(err); return; }
@@ -2160,6 +3192,7 @@ public class MainActivity extends Activity {
                         String rerr = tree.renameKey(container, key, nk);
                         if (rerr != null) { toast(rerr); return; }
                     }
+                    checkpointIfEditing();   // 实质编辑点保存 → 立即把这整棵写进 .ws 草稿(不依赖离开再落)
                     dlg.dismiss();
                     refreshSaveButton();
                     renderContainer();
@@ -2171,6 +3204,59 @@ public class MainActivity extends Activity {
     /** 模式标识：false＝①直接给值(原样，可空叶子/可粘 JSON 文本)；true＝②对象壳(建空对象可随后逐层下钻)。 */
     private static final int MODE_FILL = 0;    // ① 直接给值
     private static final int MODE_SHELL = 1;   // ② 对象壳
+
+    /**
+     * 纯数字序号容器的下一个 key：当 container 的直接子 key 全部都是非负整数(或为空)时，
+     * 返回 目前最大值+1 的字符串(空容器从 1 开始)；混合/非数字则返回 null(不预填,走原逻辑)。
+     * 用于 LoadingTips_Default 这类 1..N 序号词典：点添加自动给下一个号。
+     */
+    private String nextSeqKey(JSONObject container) {
+        if (container == null) return null;
+        java.util.Set<Long> used = new HashSet<>();
+        int numeric = 0, total = 0;
+        java.util.Iterator<String> it = container.keys();
+        long hi = 0;
+        while (it.hasNext()) {
+            String k = it.next();
+            total++;
+            long v;
+            boolean isInt = false;
+            try { v = Long.parseLong(k.trim()); isInt = (v >= 0); } catch (Exception e) { v = -1; isInt = false; }
+            if (isInt) { numeric++; used.add(v); if (v > hi) hi = v; }
+        }
+        if (total > 0 && numeric != total) return null;   // 非纯数字容器，不乱预填
+        // “最小空当”优先：从 1 开始找第一个还没被占用的正整数；没有空当再接着 max+1
+        long next = 1;
+        while (used.contains(next)) next++;                // 空容器 used 空 → next=1；连号到 hi 则扫到 hi+1
+        return String.valueOf(next);
+    }
+
+    /** 快速滑到 targetRow：不用瞬移 setSelection，也避免 ListView 平滑滑过远列表时“等半天”。
+     *  分约 12 帧(setSelectionFromTop)约 190ms 结束，视觉上是快滑而非瞬间剪贴。 */
+    private void fastSeekRow(final ListView lv, final int targetRow) {
+        if (lv == null || lv.getAdapter() == null) return;
+        int count = lv.getAdapter().getCount();
+        if (count <= 0) return;
+        int target = Math.max(0, Math.min(count - 1, targetRow));
+        final int from = Math.max(0, lv.getFirstVisiblePosition());
+        if (from == target) return;
+        final Handler h = new Handler(Looper.getMainLooper());
+        final int steps = 12;
+        final long delay = 16;                    // 16ms×12 ≈ 192ms，够快也不显传送
+        final int[] frame = {0};
+        h.post(new Runnable() {
+            @Override public void run() {
+                frame[0]++;
+                int pos = from + (int) Math.round((target - from) * ((double) frame[0] / steps));
+                lv.setSelectionFromTop(pos, 0);
+                if (frame[0] >= steps) {
+                    lv.setSelectionFromTop(target, 0);
+                } else {
+                    h.postDelayed(this, delay);
+                }
+            }
+        });
+    }
 
     private void promptAddKey(JSONObject container) {
         LinearLayout box = new LinearLayout(this);
@@ -2228,6 +3314,12 @@ public class MainActivity extends Activity {
         EditText keyInput = new EditText(this);
         keyInput.setHint("key 名称");
         styleEditBox(keyInput);
+        // 纯数字序号容器(如 LoadingTips_Default 1..141)：点“新建 key”自动预填下一个号(现141→142)
+        String seqKey = nextSeqKey(container);
+        if (seqKey != null) {
+            keyInput.setText(seqKey);
+            keyInput.setSelection(0, seqKey.length());
+        }
         LinearLayout.LayoutParams klp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -2261,6 +3353,7 @@ public class MainActivity extends Activity {
                         if (nv.trim().isEmpty()) {
                             String err = tree.addObjectShell(container, nk);
                             if (err != null) { toast(err); running[0] = java.lang.Boolean.FALSE; return; }
+                            wsMarkPending();                 // 阶段1：真实“新建/添加 key/壳”即登记总暂存(不依赖离开)
                             dlg.dismiss();
                             refreshSaveButton();
                             path.add(nk);                    // 直接落到刚建的空壳层
@@ -2270,6 +3363,7 @@ public class MainActivity extends Activity {
                         // 用户给了一段文本 → 交给 addKey 自动做类型推断(可能变对象/数组/文本)；不自动下钻
                         String err2 = tree.addKey(container, nk, nv);
                         if (err2 != null) { toast(err2); running[0] = java.lang.Boolean.FALSE; return; }
+                        wsMarkPending();                  // 阶段1：真实新增即登记
                         dlg.dismiss();
                         refreshSaveButton();
                         renderContainer();
@@ -2278,6 +3372,7 @@ public class MainActivity extends Activity {
                     // ① 直接给值(原行为)
                     String err3 = tree.addKey(container, nk, nv);
                     if (err3 != null) { toast(err3); running[0] = java.lang.Boolean.FALSE; return; }
+                    wsMarkPending();                  // 阶段1：真实新增即登记
                     dlg.dismiss();
                     refreshSaveButton();
                     renderContainer();
@@ -2315,6 +3410,17 @@ public class MainActivity extends Activity {
                 .setNegativeButton("取消", null)
                 .show();
     }
+    /** C-2：整档收藏行在 json 改名后一并改名(避免孤儿「分支id|旧名」)。仅在确实收藏旧名时才改变集合并落盘。 */
+    private void favFileRename(String brId, String oldName, String newName) {
+        if (brId == null || oldName == null || newName == null) return;
+        if (oldName.equals(newName)) return;
+        String a = brId + "|" + oldName;
+        String b = brId + "|" + newName;
+        if (!favFiles.remove(a)) return;          // 本来就没收藏旧名 → 不用动
+        if (!favFiles.contains(b)) favFiles.add(b);
+        saveFavFiles();
+    }
+
     private void saveFavFiles() {
         try {
             StringBuilder sb = new StringBuilder();
@@ -2362,6 +3468,9 @@ public class MainActivity extends Activity {
                             if (!src.renameTo(dst)) throw new Exception("重命名失败");
                         }
                     } catch (Exception e) { toast("重命名失败: " + e.getMessage()); return; }
+                    String brid = br.id == null ? "" : String.valueOf(br.id);
+                    pendingFileRekey(brid, oldName, nn);        // 阶段4:json改名后重挂未保存暂存
+                    favFileRename(brid, oldName, nn);           // C-2:整档收藏(favfiles)也随改名迁移,避免孤儿星表
                     dlg.dismiss();
                     toast("已重命名");
                     showBranchHint(br);
@@ -2371,16 +3480,35 @@ public class MainActivity extends Activity {
     }
 
     private void deleteFileAction(Branch br, String name) {
+        final boolean isSaf = br != null && br.hasSaf();
+        final String extra = isSaf ? "\n（此分支绑定的是外部 SAF 目录，删除是直接被外部移除，不进入回收站、不可恢复。）"
+                                   : "\n（回收站开启时，本地 json 删除会先放入回收站，可去回收站恢复。）";
         new AlertDialog.Builder(this)
                 .setTitle("删除文件")
-                .setMessage("确定删除 " + name + " ？ 该操作不可撤销。")
+                .setMessage("确定删除 " + name + " ？" + extra)
                 .setPositiveButton("删除", (d, w) -> {
                     try {
                         if (br.hasSaf()) {
                             SafDir.deleteFile(this, br.safUri, name);
                         } else {
                             File f = new File(new File(rootDir, br.getJsonDirName()), name);
-                            if (f.exists() && !f.delete()) throw new Exception("删除失败");
+                            // 回收开且是本地 json → 整份软删入 recycle/json，hash 只管夹名、原名放 realName
+                            if (recycleEnabled() && f.exists()) {
+                                JSONObject j = new JSONObject(readAll(f));
+                                JSONObject rec = new JSONObject();
+                                rec.put("kind", "json");
+                                rec.put("realName", name);
+                                rec.put("branch", br.id);
+                                rec.put("branchTitle", br.title);
+                                rec.put("put_at", System.currentTimeMillis());
+                                rec.put("data", j);
+                                String hid = "json" + (System.currentTimeMillis() % 2147483647L);
+                                java.io.File ex = new java.io.File(rcFolder("json"), hid + ".json");
+                                int k = 0; while (ex.exists()) ex = new java.io.File(rcFolder("json"), (hid + "_" + (++k)) + ".json");
+                                writeJsonAstex(ex, rec.toString(2));
+                                idx_push("json", ex.getName(), (br.title == null ? "" : br.title) + "/" + name, br.title, name);
+                            }
+                            if (!f.exists() || !f.delete()) throw new Exception("删除失败");
                         }
                     } catch (Exception e) { toast("删除失败: " + e.getMessage()); return; }
                     toast("已删除 " + name);
@@ -2394,7 +3522,8 @@ public class MainActivity extends Activity {
 
     /** 有未保存改动时高亮右上角保存按钮(蓝底白字)；无改动置灰禁用。 */
     private void refreshSaveButton() {
-        boolean has = tree != null && tree.isDirty();
+        // 阶段1：总保存亮起 = “当前这份有未保存” 或 “跨任一分支/主页里尚有未落盘暂存(pending)” —— 二者都视为要落盘的内容
+        boolean has = (tree != null && tree.isDirty()) || wsLivePendingCount() > 0 || wsLiveBufExists();
         btnSave.setEnabled(has);
         btnSave.setClickable(has);
         // 图标：无改动时半透明置灰，有改动时纯白“点亮”
@@ -2404,12 +3533,41 @@ public class MainActivity extends Activity {
 
     /** 保存按钮点击：真正的写盘入口。 */
     private void doSave() {
-        if (tree == null || openName == null) { toast(getString(R.string.need_branch)); return; }
+        // 阶段2：总保存应在“没开任何分支/文件(主页面)”也能把 .ws/pending 里所有未落盘份整体写盘
+        if (tree == null || openName == null) {
+            int n = flushPendingToDisk();
+            try { File cf = wsBufFile(); if (cf.exists()) cf.delete(); } catch (Exception ignore) { }
+            refreshSaveButton();
+            if (n == 0) toast(getString(R.string.nothing_to_save));
+            else toast("已把 " + n + " 份未保存内容写入磁盘");
+            return;
+        }
         if (!tree.isDirty()) { toast(getString(R.string.nothing_to_save)); return; }
+        // 软删：真删前快照待删，落盘后再把对应 key 的收藏清掉(收藏夹立即反映删除)
+        java.util.List<Object[]> delSnap = tree.pendingSnap();
+        int removedNow = 0;
+        if (!delSnap.isEmpty()) {   // 先回收(此刻仍在树上)再真删
+            for (Object[] o : delSnap) {
+                @SuppressWarnings("unchecked")
+                java.util.List<String> rseg = (java.util.List<String>) o[0];
+                recycleFromPendingRemove(rseg, (String) o[1]);
+            }
+            removedNow = tree.applyPendingDel();
+        }
+        if (removedNow > 0) {
+            for (Object[] o : delSnap) {
+                @SuppressWarnings("unchecked")
+                java.util.List<String> seg = (java.util.List<String>) o[0];
+                removeFavs(seg, (String) o[1]);             // 命中即从收藏表移除并持久化(removeFavs 内部 saveFavorites)
+                markDelSaved(seg, (String) o[1]);           // 记录页删除型转为“已删”
+            }
+        }
         try { writeTreeToDisk(); }
         catch (Exception e) { toast("保存失败: " + e.getMessage()); return; }
         HistoryLog.commitSave(openName, tree.rootObject());   // 记录：本次相对打开/上次，变了哪些 key(旧→新)
         tree.clearDirty();
+        clearWsBuf();                        // 已正式落盘，清掉那份防崩溃草稿
+        if (currentBranch != null && openName != null) wsClearPendingOf(currentBranch.id == null ? "" : currentBranch.id, openName);
         refreshSaveButton();
         toast(getString(R.string.save_done));
         // （保存就正常写回当前文件，不再自动同步“核心汉化”目录；需要另行手动导入。）
@@ -2425,6 +3583,50 @@ public class MainActivity extends Activity {
             if (!d.exists()) d.mkdirs();
             writeLocal(new File(d, openName), text);
         }
+    }
+
+    /** 阶段2：把“.ws/pending 里所有未落盘份(含其它分支/文件)”按各自分支与文件名真正写盘。
+     *  某分支已被删除/不在存活库则不动它(保留暂存不丢,返回需跳过);返回写盘个数。 */
+    /** 把快照文本里的软删清单真正应用到落盘内容(总保存=真删)。 */
+    private String applyDeletesTo(String text, org.json.JSONArray del) {
+        if (text == null || text.isEmpty() || del == null || del.length() == 0) return text;
+        try {
+            StringBuilder err = new StringBuilder();
+            JsonTree t = JsonTree.fromText(text, err);
+            if (t == null) return text;
+            t.delImport(del);
+            t.applyPendingDel();
+            return t.dump();
+        } catch (Exception ignore) { return text; }
+    }
+
+    private int flushPendingToDisk() {
+        File dir = wsPendingDir();
+        File[] fs = dir == null ? null : dir.listFiles();
+        if (fs == null || fs.length == 0) return 0;
+        int wrote = 0; int skipped = 0;
+        for (File f : fs) {
+            if (!f.isFile() || !f.getName().endsWith(".buf")) continue;
+            try {
+                JSONObject meta = new JSONObject(readAll(f));
+                String brId = meta.optString("branchId", "");
+                String name = meta.optString("openName", "");
+                String text = meta.optString("text", "");
+                if (brId.isEmpty() || name.isEmpty() || text.isEmpty()) continue;
+                Branch b = repos.byId(brId);
+                if (b == null) { skipped++; continue; }          // 分支已删 → 暂存保留到最后由恢复/删除逻辑接管
+                String finalText = applyDeletesTo(text, meta.optJSONArray("del"));  // 总保存=把软删项真删后落盘
+                writeTextIntoBranch(b, name, finalText);
+                if (!f.delete()) f.deleteOnExit();
+                wrote++;
+            } catch (Exception ignore) { skipped++; }
+        }
+        return wrote;
+    }
+    /** 把 (branch,file,text) 以该分支方式实际落盘：SAF 或本地草稿目录下同名文件。 */
+    private void writeTextIntoBranch(Branch b, String file, String text) throws Exception {
+        if (b.hasSaf()) { SafDir.writeFile(this, b.safUri, file, text); }
+        else { File d = new File(rootDir, b.getJsonDirName()); if (!d.exists()) d.mkdirs(); writeLocal(new File(d, file), text); }
     }
 
     /** 写本地文本(UTF-8)。 */
@@ -2515,11 +3717,6 @@ public class MainActivity extends Activity {
             row.addView(star, new LinearLayout.LayoutParams(dp(24), dp(24)));
             return row;
         }
-        private void setFavStar(ImageView iv, boolean on) {
-            iv.setImageResource(R.drawable.ic_fav);
-            iv.setColorFilter(on ? 0xFFE09B3D : 0x33999999);
-            iv.setPadding(0, 0, 0, 0);
-        }
     }
 
     /** 分层浏览容器：sortedKeys + 层末「＋ 新建 key」占位行。 */
@@ -2527,13 +3724,15 @@ public class MainActivity extends Activity {
         private final JsonTree t;
         private final JSONObject container;
         private final List<String> keys;
+        private final List<String> parentSegs;   // 本层行所属容器在树里的祖先-seg(=path)，判断“待删”用
         private final int highlightPos;   // 该层要标亮的行号；-1=无(搜索跳转)
         ContainerAdapter(JsonTree tr, JSONObject c) { this(tr, c, null); }
         ContainerAdapter(JsonTree tr, JSONObject c, String hlKey) {
             t = tr; container = c; keys = tr.sortedKeys(c);
+            parentSegs = new ArrayList<>(path);   // 构造该层列表那一刻的父链
             highlightPos = (hlKey == null ? -1 : keys.indexOf(hlKey));
         }
-        @Override public int getCount() { return keys.size() + 1; }        // 末行 = 「＋ 新建」
+        @Override public int getCount() { return keys.size(); }
         @Override public Object getItem(int i) { return i < keys.size() ? keys.get(i) : null; }
         @Override public long getItemId(int i) { return i; }
         // 末行「＋ 新建」也可点(isEnabled 恒 true)，否则 ListView 禁用行不触发点击导致没反应。
@@ -2595,17 +3794,41 @@ public class MainActivity extends Activity {
             kt.setTypeface(null, Typeface.BOLD);
             kt.setSingleLine(true);
             kt.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            boolean favRow = isFaved(curSelfSegs, k);   // 只对该行本身判定(逐粒)
-            if (favRow) {
+            boolean favRow = isFavedLive(curSelfSegs, k);  // 只对该行本身判定(逐粒,目标必须在且未待删才亮星)
+            boolean pendRow = t.isPendingDel(parentSegs, k);   // 是否已“标为待删”→ 行尾显示垃圾桶
+            final List<String> thisSeg = parentSegs;
+            if (favRow || pendRow) {
+                // 待删/收藏的“尾巴”统一钉在行的最右一条竖轨上(收藏星+垃圾桶同列相邻)，
+                // 视觉整齐；垃圾桶只在收藏星右侧、同列高宽一致，不四处飘位。
                 LinearLayout ktWrap = new LinearLayout(MainActivity.this);
                 ktWrap.setOrientation(LinearLayout.HORIZONTAL);
                 ktWrap.setGravity(Gravity.CENTER_VERTICAL);
                 ktWrap.addView(kt, new LinearLayout.LayoutParams(0, -2, 1f));
-                ImageView favStar = new ImageView(MainActivity.this);
-                favStar.setImageResource(R.drawable.ic_fav);
-                favStar.setColorFilter(0xFFE09B3D);
-                favStar.setPadding(dp(2), dp(1), dp(0), dp(1));
-                ktWrap.addView(favStar, new LinearLayout.LayoutParams(dp(18), dp(18)));
+                LinearLayout rail = new LinearLayout(MainActivity.this);
+                rail.setOrientation(LinearLayout.HORIZONTAL);
+                rail.setGravity(Gravity.CENTER_VERTICAL);
+                if (favRow) {
+                    ImageView favStar = new ImageView(MainActivity.this);
+                    favStar.setImageResource(R.drawable.ic_fav);
+                    favStar.setColorFilter(0xFFE09B3D);
+                    favStar.setPadding(dp(2), dp(1), dp(0), dp(1));
+                    rail.addView(favStar, new LinearLayout.LayoutParams(dp(18), dp(18)));
+                }
+                if (pendRow) {
+                    ImageView pendTrash = new ImageView(MainActivity.this);
+                    pendTrash.setImageResource(R.drawable.ic_baseline_auto_delete);
+                    pendTrash.setColorFilter(0xFFD64545);               // 红：待删除
+                    pendTrash.setPadding(dp(0), dp(1), dp(1), dp(1));
+                    rail.addView(pendTrash, new LinearLayout.LayoutParams(dp(18), dp(18)));
+                    pendTrash.setOnLongClickListener(p -> {
+                        t.undoPendingDel(thisSeg, k);                   // 长按垃圾桶=取消待删(无确认)
+                        wsBufHandler.post(() -> { if (tree != null && liveListLv != null) reRenderRowList(); });
+                        return true;
+                    });
+                }
+                ktWrap.addView(rail, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT));
                 box.addView(ktWrap);
             } else {
                 box.addView(kt);
@@ -2652,9 +3875,66 @@ public class MainActivity extends Activity {
         String key;                  // 命中的那个 key
         List<String> containerSegs; // 从根到“包含命中 key 的容器”的段(用于跳转定位到该容器层)
         String fileOf;               // 标注用：文件·最上层条目简述经 join
+        String rightTag;             // items 特殊搜索：该 key 的“物品名称(中文)”→显示在 key 行右侧；空则不显示该补标
+        boolean tipSync;             // 特殊搜索自动补出的“对侧(ItemTooltip)”整行标记，仍可照常跳转
     }
 
-    /** 递归在某个 JSONObject(子)树里收集 key 或 value 文本包含 needle 的叶子/对象命中。 */
+/** 判断一条命中是否恰好处在某个单层块里(直接是该块对象的直属 key)。 */
+private static boolean topIsBlock(Hit h, String block) {
+    return h != null && h.upper != null && h.upper.size() == 1 && block.equals(h.upper.get(0));
+}
+
+/**
+ * items 特殊搜索增强：仅当该份 json 顶层同时有 ItemName 与 ItemTooltip 两块才生效。<br>
+ * 命中某块里的物品 key(名字/介绍内容命中同类 key)时, 对侧块只要有同 key → 补出那一侧一个 tipSync 行(可跳转);
+ * 并能取到 ItemName 中文名 → 记入 rightTag 供 key 行右侧显示实际内容。取不到(无介绍/打错搜不到)则不补不显示。
+ */
+private static void enhanceItemHits(JSONObject root, String fn, List<Hit> hits) {
+    JSONObject names = root == null ? null : root.optJSONObject("ItemName");
+    JSONObject tips  = root == null ? null : root.optJSONObject("ItemTooltip");
+    if (names == null || tips == null) return;                 // 非 items 结构 → 普通搜索，什么都不加
+
+    // (file|块|key) 集合: 结果里已有这些行, 补对侧时跳过以防重复
+    java.util.Set<String> present = new java.util.HashSet<>();
+    for (Hit h : hits)
+        if (h != null && h.file != null && h.upper != null)
+            present.add(h.file + '\u0001' + (h.upper.size() == 1 ? h.upper.get(0) : "") + '\u0001' + h.key);
+
+    List<Hit> add = new ArrayList<>();
+    java.util.Set<String> done = new java.util.HashSet<>();
+    for (Hit h : hits) {
+        if (h == null || h.file == null || !h.file.equals(fn)) continue;
+        String k = h.key;
+        if (k == null) continue;
+        // 只要 key 也是某物品名 → 把中文名放右侧补览(key/文字命中都给)
+        if (names.has(k) && (h.rightTag == null || h.rightTag.isEmpty()))
+            h.rightTag = names.optString(k, "");
+        if (topIsBlock(h, "ItemName"))
+            syncSibling(h, "ItemTooltip", names, tips, present, done, add);
+        else if (topIsBlock(h, "ItemTooltip"))
+            syncSibling(h, "ItemName", names, tips, present, done, add);
+    }
+    if (!add.isEmpty()) hits.addAll(add);
+}
+
+/** 命中块 h + 对侧同名 key 存在 → 补一行可跳转的对侧行。 */
+private static void syncSibling(Hit h, String sideBlock, JSONObject names, JSONObject tips,
+                                Set<String> present, Set<String> done, List<Hit> add) {
+    JSONObject side = "ItemName".equals(sideBlock) ? names : tips;
+    if (side == null || h.key == null || !side.has(h.key)) return;            // 对侧没有同名 → 不补
+    String tag = h.file + '\u0001' + sideBlock + '\u0001' + h.key;
+    if (present.contains(tag) || done.contains(tag)) return;
+    Hit n = new Hit();
+    n.file = h.file;
+    n.key = h.key;
+    n.upper = new ArrayList<>(java.util.Collections.<String>singletonList(sideBlock));
+    n.containerSegs = new ArrayList<>(java.util.Collections.<String>singletonList(sideBlock));
+    n.tipSync = true;
+    if (names != null && names.has(h.key)) n.rightTag = names.optString(h.key, "");
+    add.add(n);
+    done.add(tag);
+}
+
     private void collectHits(JSONObject node, List<String> containerSegs, String fileName,
                              String needle, boolean ci, List<Hit> out) {
         if (node == null) return;
@@ -2707,6 +3987,311 @@ public class MainActivity extends Activity {
         } catch (Exception e) { return null; }
     }
 
+    // ================= 防崩溃草稿(未点总保存的编辑/软删，本地 .ws 目录) =================
+    // 草稿仍放 rootDir/.ws；但会让仓库扫描跳过所有“.”开头目录(见 RepoRegistry)，
+    // 因此不会把它当分支列进分支/收藏页，也保持私有持久落盘区。
+    private File wsDir() { return new File(rootDir, ".ws"); }
+    private File wsBufFile() { return new File(wsDir(), "current.buf"); }
+    /** 存在未落盘显示的依据还包括：离开时的崩溃草稿文件仍在(它代表“有过未保存编辑且还没总保存”)。 */
+    private boolean wsBufExists() { try { return wsBufFile().exists(); } catch (Exception e) { return false; } }
+
+    // ------------ 阶段4·改名/删除下让暂存“rekey 不丢” ------------
+    /** json 被改名成 newName 时，把同分支下旧名那份 pending 槽重挂到新名(并同步 .buf)，不让改动错位。 */
+    private void pendingFileRekey(String brId, String oldName, String newName) {
+        try {
+            if (oldName == null || oldName.equals(newName) || oldName.isEmpty() || newName == null || newName.isEmpty()) return;
+            File dir = wsPendingDir(); File[] fs = dir == null ? null : dir.listFiles();
+            if (fs == null) return;
+            for (File f : fs) {
+                if (!f.isFile() || !f.getName().endsWith(".buf")) continue;
+                try {
+                    JSONObject meta = new JSONObject(readAll(f));
+                    if (!brId.equals(meta.optString("branchId", ""))) continue;
+                    if (!oldName.equals(meta.optString("openName", ""))) continue;
+                    String text = meta.optString("text", "");
+                    JSONObject nm = new JSONObject();
+                    nm.put("branchId", meta.optString("branchId", ""));
+                    nm.put("openName", newName);
+                    nm.put("text", text);
+                    writeLocal(wsPendingFile(brId, newName), nm.toString(2));
+                    if (!f.delete()) f.deleteOnExit();
+                    return;
+                } catch (Exception ignore) { }
+            }
+        } catch (Exception ignore) { }
+    }
+    /** 分支重命名(id 变 newBrId)时，把旧 branchId 的 pending/.buf 全部改挂新 id。 */
+    private void pendingBranchRekey(String oldBrId, String newBrId) {
+        if (oldBrId == null || newBrId == null || oldBrId.equals(newBrId)) return;
+        try {
+            File dir = wsPendingDir(); File[] fs = dir == null ? null : dir.listFiles();
+            if (fs == null) return;
+            for (File f : fs) {
+                if (!f.isFile() || !f.getName().endsWith(".buf")) continue;
+                try {
+                    JSONObject meta = new JSONObject(readAll(f));
+                    if (!oldBrId.equals(meta.optString("branchId", ""))) continue;
+                    writeLocal(wsPendingFile(newBrId, meta.optString("openName", "")), meta.toString(2));
+                    if (!f.delete()) f.deleteOnExit();
+                } catch (Exception ignore) { }
+            }
+        } catch (Exception ignore) { }
+    }
+
+    // ------------- 阶段1·“分支多份暂存槽” -------------
+    // 与崩溃备份同目录(.ws)，但按 “分支+json 名” 一份一文件保存，供 总保存/退出确认 盘点“尚未落盘”的改动；
+    // 真正把这些份批量写盘属于第2阶段，现只负责把【真实“编辑保存”】随时登记 + 点亮总保存(任意分支/主页)。
+    private File wsPendingDir() { File d = new File(wsDir(), "pending"); if (!d.exists()) { try { d.mkdirs(); } catch (Exception ignore) { } } return d; }
+    private File wsPendingFile(String brId, String name) {
+        String br = (brId == null || brId.isEmpty()) ? "_" : brId;
+        String nm = (name == null || name.isEmpty()) ? "_" : name.replace('/', '_');
+        return new File(wsPendingDir(), br + "__" + nm + ".buf");
+    }
+    private int wsPendingCount() {
+        File[] fs = wsPendingDir().listFiles();
+        int n = 0; if (fs != null) { for (File f : fs) { if (f.isFile() && f.getName().endsWith(".buf")) n++; } } return n;
+    }
+    /** 只在“尚存活分支名下”的未落盘份(即它当前真正可以落盘、总保存“有东西可写”)才算亮灯依据。
+     *  被删/在回收站的暂存仍保留不删,但不计入灯;恢复 rekey 后会重新由 alive 可见而恢复点亮。 */
+    private int wsLivePendingCount() {
+        File[] fs = wsPendingDir().listFiles();
+        if (fs == null) return 0;
+        int n = 0;
+        for (File f : fs) {
+            if (!f.isFile() || !f.getName().endsWith(".buf")) continue;
+            try {
+                JSONObject m = new JSONObject(readAll(f));
+                if (repos.byId(m.optString("branchId", "")) != null) n++;
+            } catch (Exception ignore) { }
+        }
+        return n;
+    }
+    private boolean wsLiveBufExists() {
+        if (!wsBufExists()) return false;
+        try { JSONObject m = new JSONObject(readAll(wsBufFile())); return repos.byId(m.optString("branchId", "")) != null; } catch (Exception e) { return wsBufExists(); }
+    }
+    private void wsMarkPending() {
+        if (tree == null || currentBranch == null || openName == null) return;
+        try {
+            JSONObject meta = new JSONObject();
+            meta.put("branchId", currentBranch.id == null ? "" : currentBranch.id);
+            meta.put("openName", openName);
+            meta.put("text", tree.dump());
+            meta.put("del", tree.delExport());
+            writeLocal(wsPendingFile(currentBranch.id == null ? "" : currentBranch.id, openName), meta.toString(2));
+        } catch (Exception ignore) { }
+    }
+    private void wsClearPendingOf(String brId, String name) {
+        try { File f = wsPendingFile(brId, name); if (f.exists()) f.delete(); } catch (Exception ignore) { }
+    }
+
+    /** 有未保存改动就(合并延迟)写一次草稿，防止进程被杀丢劳动；写盘只在需要时,体量小不卡。 */
+    private void scheduleWsFlush() {
+        if (wsBufScheduled) return;
+        if (tree == null || tree.rootObject() == null) return;          // 空/未打开不用保护
+        wsBufScheduled = true;
+        wsBufHandler.removeCallbacksAndMessages(null);
+        wsBufHandler.postDelayed(() -> { wsBufScheduled = false; flushWsBufNow(); }, 800);
+    }
+
+    /** 立即把打开的这份 json “最新缓存文本”写成草稿(含定位信息)。不落主文件。 */
+    private synchronized void flushWsBufNow() {
+        wsBufScheduled = false;
+        if (tree == null || tree.rootObject() == null) return;
+        try {
+            File d = wsDir(); if (!d.exists()) { if (!d.mkdirs()) return; }
+            JSONObject meta = new JSONObject();
+            if (currentBranch != null) {
+                meta.put("branchId", currentBranch.id == null ? "" : currentBranch.id);
+                meta.put("branchTitle", currentBranch.title == null ? "" : currentBranch.title);
+            }
+            meta.put("openName", openName == null ? "" : openName);
+            meta.put("text", tree.dump());
+            meta.put("del", tree.delExport());                 // 软删清单一并存档: 删分支/回主页后仍保持“待删”态
+            writeLocal(wsBufFile(), meta.toString(2));
+        } catch (Exception ignore) { }
+    }
+
+    /** 离开前若还有未保存编辑，立即同步写一份 .ws 草稿(不用等 800ms 延时)——这是“临时保存”的权威单一落点。 */
+    private void checkpointIfEditing() {
+        if (tree == null || openName == null) return;
+        if (currentBranch == null || !tree.isDirty()) return;
+        wsMarkPending();                      // 阶段1：把这份“未落盘”改动登记为分支级总暂存(供跨分支/主页常亮总保存)
+        try { flushWsBufNow(); } catch (Exception ignore) { }   // 崩溃应急快照照旧(同目录同源,不重复)
+    }
+
+    /** 同分支内从当前编辑中的 A 切到另一份 B：先把 A 那份落草稿(.ws 当前只存一份,拿切换点当权威 checkpoint)。 */
+    private void checkpointSwitchIF(final Branch br, final String newer) {
+        if (currentBranch == br && currentBranch != null && openName != null
+                && !openName.equals(newer) && tree != null && tree.isDirty()) {
+            try { flushWsBufNow(); } catch (Exception ignore) { }
+        }
+    }
+
+    /** 同会话又在同分支把同一文件打开回来时自动接回其中未保存草稿(不打扰提示)。匹配到即 adopt 并返回 true。 */
+    private boolean autoReAdoptWs(final Branch br, final String name) {
+        final File f = wsBufFile();
+        if (f == null || !f.exists() || br == null) return false;
+        try {
+            final JSONObject meta = new JSONObject(readAll(f));
+            if (!name.equals(meta.optString("openName"))) return false;
+            if (!bString(br).equals(meta.optString("branchId"))) return false;
+            final String txt = meta.optString("text");
+            if (txt == null || txt.isEmpty()) return false;
+            final org.json.JSONArray delx = meta.optJSONArray("del");
+            if (!f.delete()) f.deleteOnExit();
+            adoptOpenText(br, name, txt);
+            if (tree != null) tree.delImport(delx);   // 继续保持“待删/软删”状态(而非丢标记)
+            refreshSaveButton();
+            try { java.util.List<Object[]> tp = tree == null ? null : tree.pendingSnap();
+                toast("TRACE buf-adopt 树待删=" + (tp == null ? 0 : tp.size()) + " 钮=" + btnSave.isEnabled());
+            } catch (Exception ignore) { }
+            return true;
+        } catch (Exception ignore) { return false; }
+    }
+    private String bString(Branch b) { return b == null ? "" : String.valueOf(b.id); }
+
+    /** 同分支・同文件若在 .ws/pending 留有未落盘快照，就把它整份连同一同 rest软删标记 adopt 回(w/o disk). */
+    private boolean adoptPendingSlot(final Branch br, final String name) {
+        final File f = wsPendingFile(br == null ? "" : br.id == null ? "" : String.valueOf(br.id), name);
+        if (f == null || !f.exists()) return false;
+        try {
+            final JSONObject meta = new JSONObject(readAll(f));
+            final org.json.JSONArray delx = meta.optJSONArray("del");
+            adoptOpenText(br, name, meta.optString("text"));
+            if (tree != null) tree.delImport(delx);       // 把待删/划线状态还回来
+            if (!f.delete()) f.deleteOnExit();
+            refreshSaveButton();                          // 该 json 内有两个待删态条目(未落盘) → 总保存应点亮
+            // —— trace(只读)：定位“待删/划线未恢复”在删・恢复・打开的哪一环断 ——
+            try {
+                java.util.List<Object[]> tp = tree == null ? null : tree.pendingSnap();
+                int cc = tp == null ? 0 : tp.size();
+                String fst = "";
+                if (tp != null && !tp.isEmpty()) {
+                    @SuppressWarnings("unchecked") java.util.List<String> s00 = (java.util.List<String>) tp.get(0)[0];
+                    fst = "首径[" + java.util.Arrays.toString(s00.toArray()) + "]·" + tp.get(0)[1];
+                }
+                toast("TRACE adopt回挂: del条=" + (delx == null ? 0 : delx.length())
+                        + " 树待删=" + cc + " | " + fst + " | 保存钮=" + btnSave.isEnabled());
+            } catch (Exception ignore) { }
+            return true;
+        } catch (Exception ignore) { return false; }
+    }
+
+    /** 保存成功或用户放弃草稿后再清掉草稿。 */
+    private void clearWsBuf() {
+        try { File f = wsBufFile(); if (f.exists()) f.delete(); } catch (Exception ignore) { }
+    }
+
+    /** 启动时若有草稿，弹恢复询问(恢复=把草稿文本接进树并标脏；放弃=删除草稿)。 */
+    private void offerRecoveryIfAny() {
+        final File f = wsBufFile();
+        if (f == null || !f.exists()) return;
+        try {
+            String raw = readAll(f);
+            if (raw == null || raw.trim().isEmpty()) { f.delete(); return; }
+            final JSONObject meta = new JSONObject(raw);
+            final String brId = meta.optString("branchId");
+            final String openFileName = meta.optString("openName");
+            final String docText = meta.optString("text");
+            if (docText.isEmpty()) { f.delete(); return; }
+            final Branch br = repos.byId(brId);
+            if (br == null) {
+                toast("检测到未保存草稿，但原分支已不存在，暂保留在回收暂存，未自动恢复。");
+                return;
+            }
+            new AlertDialog.Builder(this)
+                .setTitle("找回未保存的草稿")
+                .setMessage("上次在「" + openFileName + "」里有未点“保存”的改动。\n恢复回来继续编辑吗？(恢复后需再点右上保存才会写盘)")
+                .setPositiveButton("恢复", (d, w) -> {
+                    f.delete();
+                    adoptOpenText(br, openFileName, docText);
+                })
+                .setNegativeButton("放弃", (d, w) -> f.delete())
+                .show();
+        } catch (Exception ignore) { }
+    }
+
+    /** 以给定内容接管打开(用于崩溃恢复)，保持与正常打开一致的渲染，并标“有待保存”。 */
+    private void adoptOpenText(Branch br, String name, String text) {
+        try {
+            StringBuilder err = new StringBuilder();
+            JsonTree nt = JsonTree.fromText(text, err);
+            if (nt == null) { toast("草稿似乎损坏无法解析：" + err); return; }
+            currentBranch = br;
+            atWelcomePage = false;                          // 已进入某 json 工作区
+            tree = nt;
+            openName = name;
+            tree.forceDirty();                              // 未点总保存，恢复后保持“待保存”态
+            HistoryLog.noteOpen(openName, tree.rootObject());
+            path.clear();
+            title.setText((br.title.equals("悠然汉化") ? "悠然" : br.title) + " / " + name);
+            renderContainer();
+        } catch (Exception e) {
+            toast("草稿恢复失败：" + e.getMessage());
+        }
+    }
+
+    /** 打开原文·记事本(极简 EditText 全屏对话框),编辑整份 json 原文,保存即时回填当前工作区。 */
+    private void showRawEditor() {
+        if (tree == null || currentBranch == null || openName == null) { toast("请先打开一个 json 再查看原文"); return; }
+        final String start = tree.dump();
+        android.app.Dialog dlg = new android.app.Dialog(this);
+        dlg.setCancelable(true);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(8), dp(8), dp(8), dp(8));
+        final android.widget.EditText ed = new android.widget.EditText(this);
+        ed.setGravity(Gravity.TOP | Gravity.START);
+        ed.setTextSize(13f);
+        ed.setTypeface(Typeface.MONOSPACE);
+        ed.setText(start);
+        ed.setSelection(start.length());
+        ed.setBackgroundColor(0xFF1A1C24);
+        ed.setTextColor(0xFFE8E8EA);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        TextView t = new TextView(this);
+        t.setText("原文 · 记事本  (" + openName + ")");
+        t.setTextSize(16f);
+        t.setTextColor(Skin.text(this));
+        t.setTypeface(null, Typeface.BOLD);
+        bar.addView(t, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        TextView save = new TextView(this);
+        save.setText("保存");
+        save.setTextSize(16f);
+        save.setTextColor(0xFF4CAF50);
+        save.setPadding(dp(12), dp(6), dp(12), dp(6));
+        save.setOnClickListener(v -> {
+            String txt = ed.getText().toString();
+            dlg.dismiss();  // 先关，避免解析长互卡时多层叠
+            adoptOpenText(currentBranch, openName, txt);
+        });
+        bar.addView(save);
+        TextView cancel = new TextView(this);
+        cancel.setText("放弃");
+        cancel.setTextSize(16f);
+        cancel.setTextColor(Skin.subText(this));
+        cancel.setPadding(dp(4), dp(6), dp(12), dp(6));
+        cancel.setOnClickListener(v -> dlg.dismiss());
+        bar.addView(cancel);
+        root.addView(bar);
+        root.addView(ed, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        dlg.setContentView(root);
+
+        android.view.Window w = dlg.getWindow();
+        if (w != null) {
+            android.view.WindowManager.LayoutParams lp = w.getAttributes();
+            lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.96f);
+            lp.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.95f);
+            w.setAttributes(lp);
+        }
+        dlg.show();
+    }
+
     /** 打开搜索弹窗：scope 为“当前打开文件”或“全局/整个分支仓库”。 */
     // ==================== 保存记录(过往保存历史) ====================
 
@@ -2714,8 +4299,8 @@ public class MainActivity extends Activity {
 
     /** 点“保存记录”按钮入口：首次包告知(可选不再弹)，之后进记录页。 */
     private void openHistoryEntry() {
-        if (HistoryLog.all().isEmpty()) {
-            toast("还没有保存记录——修改内容并点右上“保存”后，这里才会记录。");
+        if (HistoryLog.all().isEmpty() && dels.isEmpty()) {
+            toast("还没有保存记录——修改内容并点右上“保存”、或删除条目后，这里才会记录。");
         }
         boolean suppressed = loadPrefBool(KEY_HIST_NO_MORE, false);
         if (!suppressed) {
@@ -2812,6 +4397,53 @@ public class MainActivity extends Activity {
             outer.addView(UiKit.spacer(MainActivity.this,6));
         }
 
+        // ===== 🗑 删除型记录(不只来自“保存修改”,还来自软删/真删 的 key) =====
+        if (!dels.isEmpty()) {
+            if (byFile.isEmpty()) {
+                TextView headerD = new TextView(this);
+                headerD.setText("👇 以下为删除操作留痕(修改上的普通记录仍在第一组)");
+                headerD.setTextSize(11f); headerD.setTextColor(Skin.mutedText(this));
+                outer.addView(headerD);
+            }
+            TextView headDel = new TextView(this);
+            headDel.setText("🗑 删除型(" + dels.size() + ")");
+            headDel.setTextSize(15f); headDel.setTypeface(Typeface.DEFAULT_BOLD);
+            headDel.setTextColor(0xFFE74C3C);
+            outer.addView(headDel);
+            outer.addView(UiKit.spacer(MainActivity.this,4));
+
+            for (DelRec d : dels) {
+                final DelRec dd = d;
+                LinearLayout card = UiKit.roundedList(MainActivity.this, 0xFFFFE5E5, dd.file);
+                card.addView(UiKit.labelLine(MainActivity.this, "key", dd.key, 0xFF222222, dd.saved));
+                TextView status = new TextView(this);
+                if (!dd.saved) { status.setText("状态：待删 — 长按去现场看/反悔"); }
+                else if (recycleEnabled()) { status.setText("状态：已删 · 回收站开 — 长按将提示去回收站");
+                    card.setBackgroundColor(0xFFFFF3CD); }
+                else { status.setText("状态：已删 · 回收站关 — 长按现场恢复(同会话)"); }
+                status.setTextSize(11f);
+                status.setTextColor(Skin.subText(this));
+                card.addView(status);
+                final java.util.List<String> segF = dd.seg;
+                card.setOnLongClickListener(v -> {
+                    if (!dd.saved) {                 // ① 还没真删：可跳去看反悔(保留当前内存编辑缓存,不走磁盘重载)
+                        if (tree != null && openName != null && openName.equals(dd.file)) {
+                            hlSegs = new ArrayList<>(segF); hlKey = dd.key; path.clear(); path.addAll(segF);
+                            if (histDlg[0] != null) histDlg[0].dismiss();   // 先关记录窗，避免“看着没跳”
+                            renderContainer();
+                        } else toast("请先切到 " + dd.file + " 所在文件再看(避免丢当前未保存编辑)");
+                    } else if (recycleEnabled()) {   // ② 已真删 & 回收站开 → 去回收站
+                        toast("该条已删除；开启回收站时请到【回收站】板块恢复");
+                    } else {                         // ③ 已真删 & 回收站关 → 同会话现场恢复
+                        recoverDel(dd);
+                    }
+                    return true;
+                });
+                outer.addView(card);
+                outer.addView(UiKit.spacer(MainActivity.this,4));
+            }
+        }
+
         ScrollView sv = new ScrollView(this);
         sv.addView(outer);
         android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
@@ -2832,6 +4464,16 @@ public class MainActivity extends Activity {
     private void savePrefBool(String k, boolean v) {
         getSharedPreferences("youran_ui", MODE_PRIVATE).edit().putBoolean(k, v).apply();
     }
+    private int loadPrefInt(String k, int def) {
+        return getSharedPreferences("youran_ui", MODE_PRIVATE).getInt(k, def);
+    }
+    private void savePrefInt(String k, int v) {
+        getSharedPreferences("youran_ui", MODE_PRIVATE).edit().putInt(k, v).apply();
+    }
+
+    /** 回收站开关(临时：只读此位，真实回收站功能后续块3实现；默认关=不启用)。 */
+    private boolean recycleEnabled() { return loadPrefBool("recycle_enabled", false); }
+    private void setRecycleEnabled(boolean v) { savePrefBool("recycle_enabled", v); }
 
     /** 历史条目“长按直达”：尽力静默保存当前未存改动(失败则停并提示)，
      *  然后按记录的文件打开并跳到该 key 现在的容器层高亮。优先用当前 key 名重新定位，
@@ -3010,6 +4652,7 @@ public class MainActivity extends Activity {
                         root = new JSONObject(txt);
                     }
                     collectHits(root, new ArrayList<String>(), fn, needle, ci, hits);
+                    enhanceItemHits(root, fn, hits);
                 } catch (Exception ignore) { }
             }
             // 搜索增强·父段过滤：仅保留“该命中有一个祖先对象名 / 其文件名包含父段”的那些行。
@@ -3046,11 +4689,30 @@ public class MainActivity extends Activity {
                     Hit h = hits.get(p);
                     LinearLayout row = new LinearLayout(MainActivity.this);
                     row.setOrientation(LinearLayout.VERTICAL);
+                    // 第一行：key（可能带右侧“物品中文名”补览）、同排可再点跳
+                    LinearLayout keyRowH = new LinearLayout(MainActivity.this);
+                    keyRowH.setOrientation(LinearLayout.HORIZONTAL);
+                    keyRowH.setGravity(android.view.Gravity.CENTER_VERTICAL);
                     TextView keyT = new TextView(MainActivity.this);
                     keyT.setTextSize(15f);
                     keyT.setText(hi(ci, h.key, needle));
                     keyT.setTextColor(Skin.text(MainActivity.this));
-                    row.addView(keyT);
+                    keyRowH.addView(keyT, new LinearLayout.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                            android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+                    // items 特殊搜索：key 行右侧给物品名实际内容(如 name=铁剑)。取不到(空)则不显示。
+                    if (h.rightTag != null && !h.rightTag.isEmpty()) {
+                        View spacerN = new View(MainActivity.this);
+                        keyRowH.addView(spacerN, new LinearLayout.LayoutParams(0, 0, 1f));
+                        TextView tagN = new TextView(MainActivity.this);
+                        tagN.setText(h.rightTag.length() > 18 ? h.rightTag.substring(0, 18) + "…" : h.rightTag);
+                        tagN.setTextSize(12f);
+                        tagN.setTextColor(Skin.accentObj(MainActivity.this));
+                        keyRowH.addView(tagN, new LinearLayout.LayoutParams(
+                                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                                android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+                    }
+                    row.addView(keyRowH);
                     // 上层/文件小字
                     String upper = h.upper == null || h.upper.isEmpty()
                             ? "(根层)" : String.join(" › ", h.upper);
@@ -3432,9 +5094,57 @@ public class MainActivity extends Activity {
     /** 极简 HSV 取色：三根滑条(H/S/V) + 实时色块。pick 以 int(ARGB) 回传。 */
     /** B：系统返回 = 回到“未选仓库”引导首页(renderWelcome)；只有已在首页时才真正退出。 */
     @Override public void onBackPressed() {
-        if (atWelcomePage) { super.onBackPressed(); return; }   // 已在首页点返回 → 照常退出 App
+        if (atWelcomePage) {
+            // 阶段3：在主页点返回 → 若还有未保存条目先弹三键确认,而不是直接退出
+            if (hasUnsavedAny()) { showUnsavedExitDialog(); return; }
+            super.onBackPressed(); return;
+        }
+        checkpointIfEditing();      // 在 json 内:未总保存的编辑先落 .ws 草稿,不让“返回=丢失”
         atWelcomePage = true;
         renderWelcome();                                        // 从仓库/json 里按返回 → 回选仓库首页
+        refreshSaveButton();                                    // 阶段1:回主页只要仍有未落盘暂存,总保存保持点亮
+    }
+
+    private boolean hasUnsavedAny() {
+        if (wsPendingCount() > 0) return true;
+        if (wsBufExists()) return true;
+        return tree != null && tree.isDirty();
+    }
+
+    /** 阶段3：主页“有未保存的修改，是否保存？”三键。 */
+    private void showUnsavedExitDialog() {
+        new android.app.AlertDialog.Builder(this)
+            .setTitle("未保存的修改")
+            .setMessage("有未保存的修改，是否保存？")
+            .setPositiveButton("保存并退出", (d, w) -> {
+                d.dismiss();
+                doSave();                                  // 在主页 → 会走“把 pending 整批写盘”的批量出口
+                super.onBackPressed();                     // 真正退出
+            })
+            .setNeutralButton("返回", (d, w) -> {          // 不退出，跳到最后修改处继续改
+                d.dismiss();
+                goToLastPendingEdit();
+            })
+            .setNegativeButton("取消", (d, w) -> d.dismiss()) // 点外/取消=什么都不做,留在主页
+            .setOnDismissListener(dg -> {})
+            .show();
+    }
+
+    /** 跳到“最近一份未保存”所在 json(继续编辑)。若该分支已被删除则只提示。 */
+    private void goToLastPendingEdit() {
+        try {
+            File dir = wsPendingDir(); File[] fs = dir == null ? null : dir.listFiles();
+            java.io.File last = null; long t = -1;
+            if (fs != null) for (File f : fs) if (f.isFile() && f.getName().endsWith(".buf") && f.lastModified() > t) { t = f.lastModified(); last = f; }
+            if (last == null) { toast("当前没有待续改的未保存内容"); return; }
+            JSONObject meta = new JSONObject(readAll(last));
+            String brId = meta.optString("branchId", ""), name = meta.optString("openName", "");
+            Branch b = repos.byId(brId);
+            if (b == null) { toast("那份分支已不存在，无法跳回"); return; }
+            // 让 openFile 自动接回同一 pending(它能 auto- adopt & 清那份槽),随后带用户进到该文件
+            if (autoReAdoptWs(b, name)) { toast("已回到最近的修改处，可继续点『编辑保存/总保存』"); return; }
+            openFile(b, name);
+        } catch (Exception e) { toast("跳回失败：" + e.getMessage()); }
     }
 
     private void openHsv(String title, int initial, java.util.function.IntConsumer onPick) {

@@ -117,8 +117,6 @@ final class Skin {
     /** 分隔线/浅层描边。 */
     static int divider(Context c) { return isDark(c) ? 0xFF2A2E35 : 0xFFEFEFEF; }
     /** 行分隔(略深一档，令行边界更清晰)。 */
-    static int rowDivider(Context c) { return isDark(c) ? 0xFF2A2E35 : 0xFFF0F0F0; }
-    /** 主表面(抽屉/右滑面板底、空态卡片底)。 */
     static int surface(Context c) { return isDark(c) ? 0xFF1E2126 : 0xFFFFFFFF; }
     /** 面板头部/分隔浅底(设置面板头)。 */
     static int surfaceAlt(Context c) { return isDark(c) ? 0xFF17191D : 0xFFF2F4F7; }

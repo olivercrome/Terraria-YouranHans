@@ -36,6 +36,8 @@ final class RepoRegistry {
         Collections.sort(list, Comparator.comparing(File::getName));
         for (File d : list) {
             String nm = d.getName();
+            if (nm.startsWith(".")) continue;        // “.”开头的内部私有目录(如草稿 .ws)永不当作分支
+            if (nm.equals("recycle")) continue;      // 回收站私有目录永不当作分支
             branches.add(new Branch(nm, nm, "本地分支", null));
         }
     }

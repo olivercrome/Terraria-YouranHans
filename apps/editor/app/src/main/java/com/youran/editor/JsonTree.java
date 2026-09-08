@@ -66,6 +66,9 @@ final class JsonTree {
     /** 保存成功后调用：清除本次会话的脏标记(右上角保存按钮随之置灰)。 */
     void clearDirty() { dirty = false; }
 
+    /** 强制置脏(例如起草稿恢复后视为未保存)。 */
+    void forceDirty() { dirty = true; }
+
     JSONObject rootObject() { return root; }
 
     /** 沿 containerPath 得到当前容器对象；路径为空返回 root。找不到返回 null。 */
@@ -93,9 +96,6 @@ final class JsonTree {
         return container.opt(key) instanceof JSONObject;
     }
 
-    boolean isArrayValue(JSONObject container, String key) {
-        return container.opt(key) instanceof JSONArray;
-    }
 
     /** 叶子值的展示文本(字符串原样/对象/数组/数字/bool/null)。 */
     String displayOf(JSONObject container, String key) {
@@ -129,12 +129,6 @@ final class JsonTree {
     }
 
     /** 删除某 key。返回错误或 null。 */
-    String deleteKey(JSONObject container, String key) {
-        if (!container.has(key)) return "key 不存在: " + key;
-        container.remove(key);
-        dirty = true;
-        return null;
-    }
 
     /** 在当前容器末尾/字典序位新增一个 key。值由 valueText 自动推断类型。 */
     String addKey(JSONObject container, String key, String valueText) {
@@ -232,9 +226,94 @@ final class JsonTree {
         return s; // 原样字符串(保留换行等)
     }
 
+    /** 值文本 → 可放 JSON 的值。与 UI 一致地支持「粘贴合法对象/数组即成为对象/数组」：
+     *  仅当首字符是 { 或 [ 且能被 JSON 解析成一个 JSONObject/JSONArray 时才转结构化；
+     *  否则回退标量(避免把 {$LegacyMenu.58} 或其它开头的译文原文误判成对象卡住保存)。
+     *  结构化值应由「＋ 对象壳/＋数组壳」优先构造；这里仅在后置值输入按需宽容。 */
     private static Object parseValue(String s) throws JSONException {
+        if (s == null) return JSONObject.NULL;
+        String t = s.trim();
+        if (t.isEmpty()) return "";
+        char c0 = t.charAt(0);
+        if (c0 == '{' || c0 == '[') {
+            Object v;
+            try {
+                v = new JSONTokener(t).nextValue();
+            } catch (JSONException e) { v = null; }
+            if (v instanceof JSONObject || v instanceof JSONArray) return v;
+        }
         return parseValueQuiet(s);
     }
+
+    // ---- 待删(软删)框架(随草稿/pending 往返持久,点总保存才真删) ------------
+    private static final class PendingDel {
+        final List<String> seg; final String key;
+        PendingDel(List<String> seg, String key) { this.seg = seg; this.key = key; }
+    }
+    private final List<PendingDel> pendingDel = new ArrayList<>();
+
+    /** 软删：登记(list, key) + 置脏。不真正从 JSON 移除；只在总保存/applyPendingDel 才移。 */
+    void addPendingDel(List<String> seg, String key) {
+        if (key == null || seg == null) return;
+        for (PendingDel p : pendingDel) if (p.key.equals(key) && p.seg.equals(seg)) return;
+        pendingDel.add(new PendingDel(new ArrayList<>(seg), key));
+        dirty = true;
+    }
+    /** 反悔：从待删清单撤销(JSON 里本来就没真的删)。 */
+    void undoPendingDel(List<String> seg, String key) {
+        java.util.Iterator<PendingDel> it = pendingDel.iterator();
+        while (it.hasNext()) { PendingDel p = it.next(); if (p.key.equals(key) && p.seg.equals(seg)) { it.remove(); break; } }
+        dirty = true;
+    }
+    boolean isPendingDel(List<String> seg, String key) {
+        for (PendingDel p : pendingDel) if (p.key.equals(key) && p.seg.equals(seg)) return true;
+        return false;
+    }
+    List<Object[]> pendingSnap() {
+        List<Object[]> out = new ArrayList<>();
+        for (PendingDel p : pendingDel) out.add(new Object[]{ new ArrayList<>(p.seg), p.key });
+        return out;
+    }
+    /** 导出待删清单供快照持久化(跨分支删/回主页仍保持待删态). */
+    org.json.JSONArray delExport() {
+        org.json.JSONArray a = new org.json.JSONArray();
+        try {
+            for (PendingDel p : pendingDel) {
+                JSONObject o = new JSONObject();
+                JSONArray s = new JSONArray();
+                for (String x : p.seg) s.put(x);
+                o.put("seg", s); o.put("key", p.key);
+                a.put(o);
+            }
+        } catch (Exception ignore) { }
+        return a;
+    }
+    /** 读回快照里的待删清单并重新标注(硬删只在点总保存 Apply 时发生). */
+    void delImport(org.json.JSONArray arr) {
+        if (arr == null) return;
+        try {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i); if (o == null) continue;
+                JSONArray s = o.optJSONArray("seg"); String k = o.optString("key", "");
+                if (k.isEmpty()) continue;
+                java.util.List<String> seg = new java.util.ArrayList<>();
+                if (s != null) for (int j = 0; j < s.length(); j++) seg.add(s.optString(j, ""));
+                addPendingDel(seg, k);
+            }
+        } catch (Exception ignore) { }
+    }
+    /** 真正把待删项从 JSON 移除(总保存时才调用).返回移除条数并清空清单. */
+    int applyPendingDel() {
+        int n = 0;
+        for (PendingDel p : pendingDel) {
+            JSONObject c = containerAt(p.seg);
+            if (c != null && c.has(p.key)) { c.remove(p.key); n++; }
+        }
+        pendingDel.clear();
+        return n;
+    }
+    /** 反悔是否曾经登记过(供 UI 判断名后垃圾桶). */
+    boolean hasDanglingDel() { return !pendingDel.isEmpty(); }
 
     // ---- 导出 ------------------------------------------------------------
 

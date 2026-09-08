@@ -27,23 +27,10 @@ final class SafDir {
     private static final String KEY_TREE = "tree_uri";
 
     /** Restore the previously granted tree Uri, else null. */
-    static Uri loadTree(Context ctx) {
-        String s = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getString(KEY_TREE, null);
-        return s == null ? null : Uri.parse(s);
-    }
 
     /** Remember a tree Uri after takePersistableUriPermission. */
-    static void saveTree(Context ctx, Uri tree) {
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit().putString(KEY_TREE, tree.toString()).apply();
-    }
 
     /** Forget the saved tree (permission lost / user switched folders). */
-    static void clearTree(Context ctx) {
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit().remove(KEY_TREE).apply();
-    }
 
     // ---- listing ---------------------------------------------------------
 

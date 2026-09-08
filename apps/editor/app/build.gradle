@@ -10,8 +10,8 @@ android {
         applicationId "com.youran.editor"
         minSdk 26
         targetSdk 34
-        versionCode 13
-        versionName "2.2.5"
+        versionCode 14
+        versionName "2.0"
     }
 
     buildTypes {
@@ -29,5 +29,6 @@ android {
 dependencies {
     // UI 美化第三轮：接入 AndroidX + Material Components
     implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
     implementation 'com.google.android.material:material:1.11.0'
 }
