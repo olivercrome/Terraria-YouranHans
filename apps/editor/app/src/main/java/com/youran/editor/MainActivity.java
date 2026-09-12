@@ -321,14 +321,12 @@ public class MainActivity extends Activity {
     private TextView rcSettingVal;   // 设置页“回收站”行的右侧数字(供 live 刷新)
     private void afterRecycleChange() {
         refreshRcSettingVal();
-        for (int k = 0; k < rcTileLive.length; k++) {
-            if (rcTileLive[k] != null) {} }
         final String[] kinds = {"branches","json","block","key"};
         for (int k = 0; k < rcTileLive.length; k++) {
             if (rcTileLive[k] == null) continue;
             try { rcTileLive[k].setText(rcLabelOf(kinds[k]) + "\n" + kindCount(kinds[k]) + " 项"); } catch (Exception ignored) { }
         }
-        if (rcHead != null && rcSubDlg != null && rcSubDlg.isShowing()) {} // rcSubDlg 由 refreshKeyList 自行重建
+        // rcSubDlg 由 refreshKeyList 自行重建，无需在此显式刷新
     }
     private void refreshRcSettingVal() {
         if (rcSettingVal == null) return;
@@ -1804,8 +1802,6 @@ public class MainActivity extends Activity {
         logDel(cur, key, container);           // 记录页出现一条“删除型”(状态待删)
         refreshSaveButton();
         renderContainer();                      // 名称后垃圾桶出现即视觉反馈,不再额外 toast
-        // —— trace(只读) ——
-        toast("TRACE软删 seg=[" + java.util.Arrays.toString(cur.toArray()) + "] key=" + key);
     }
     private void removeFavs(List<String> parent, String key) {
         boolean touched = false;
@@ -4143,9 +4139,6 @@ private static void syncSibling(Hit h, String sideBlock, JSONObject names, JSONO
             adoptOpenText(br, name, txt);
             if (tree != null) tree.delImport(delx);   // 继续保持“待删/软删”状态(而非丢标记)
             refreshSaveButton();
-            try { java.util.List<Object[]> tp = tree == null ? null : tree.pendingSnap();
-                toast("TRACE buf-adopt 树待删=" + (tp == null ? 0 : tp.size()) + " 钮=" + btnSave.isEnabled());
-            } catch (Exception ignore) { }
             return true;
         } catch (Exception ignore) { return false; }
     }
@@ -4162,18 +4155,6 @@ private static void syncSibling(Hit h, String sideBlock, JSONObject names, JSONO
             if (tree != null) tree.delImport(delx);       // 把待删/划线状态还回来
             if (!f.delete()) f.deleteOnExit();
             refreshSaveButton();                          // 该 json 内有两个待删态条目(未落盘) → 总保存应点亮
-            // —— trace(只读)：定位“待删/划线未恢复”在删・恢复・打开的哪一环断 ——
-            try {
-                java.util.List<Object[]> tp = tree == null ? null : tree.pendingSnap();
-                int cc = tp == null ? 0 : tp.size();
-                String fst = "";
-                if (tp != null && !tp.isEmpty()) {
-                    @SuppressWarnings("unchecked") java.util.List<String> s00 = (java.util.List<String>) tp.get(0)[0];
-                    fst = "首径[" + java.util.Arrays.toString(s00.toArray()) + "]·" + tp.get(0)[1];
-                }
-                toast("TRACE adopt回挂: del条=" + (delx == null ? 0 : delx.length())
-                        + " 树待删=" + cc + " | " + fst + " | 保存钮=" + btnSave.isEnabled());
-            } catch (Exception ignore) { }
             return true;
         } catch (Exception ignore) { return false; }
     }
