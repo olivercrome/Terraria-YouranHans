@@ -24,8 +24,8 @@
     },
     "Language": {
         "English": "悠然汉化修正V8.2.3",
-        "Spanish": "在此特别感谢:二柱子,lzup的技术指导!!",
-        "French": "本汉化修正版本完全免费！禁止商业用途！抵制倒卖！",
+        "Spanish": "官方中文Wiki汉化",
+        "French": "在此特别感谢:二柱子,lzup的技术指导!!",
         "Italian": "汉化成员:B站(悠然_ing),(Dr.克伦威尔)",
         "Russian": "在此特别感谢皮皮蛙大佬，汉化界的里程碑",
         "Chinese": "爱来自中文",
@@ -35,7 +35,7 @@
         "Portuguese": "感谢P汉!参考了P汉!",
         "German": "Potralia的害人汉化(害人pro Max)",
         "Polish": "本汉化基于皮皮蛙大佬汉化进行145修正",
-        "Korean": "韩语"
+        "Korean": "本汉化修正版本完全免费！禁止商业用途！抵制倒卖！"
     },
     "CLI": {
         "Server": "泰拉瑞亚服务器{0}",
@@ -113,7 +113,7 @@
         "BanMessage": "已从服务器封禁。",
         "InvalidCommand": "无效命令。",
         "SetInitialPort": "服务器端口（按回车表示7777）:",
-        "AutomaticPortForward": "自动转发端口？（是\/否）：",
+        "AutomaticPortForward": "自动转发端口？（是/否）：",
         "Yes": "是",
         "ShortYes": "是",
         "No": "否",
@@ -145,7 +145,7 @@
         "WorldNameLengthTooLong": "所输入的世界名称太长！（字符数上限：{0}）",
         "SeedLengthTooLong": "所输入的种子太长！（字符数上限：{0}）",
         "SecretSeedEnabled": "秘密已激活！",
-        "EnterSeedToggleNumber": "输入种子编号以启用 \/ 禁用（留空即可继续）："
+        "EnterSeedToggleNumber": "输入种子编号以启用 / 禁用（留空即可继续）："
     },
     "UI": {
         "Effects": "效果",
@@ -362,7 +362,7 @@
         "PreviewArmorHallowed": "预览神圣盔甲",
         "PreviewArmorFormal": "预览正装",
         "PreviewArmorSwimming": "预览泳装",
-        "ItemSetBonusEquipped": "套装奖励({Numerator}\/{Denominator})\\ {Description}",
+        "ItemSetBonusEquipped": "套装奖励({Numerator}/{Denominator})\\ {Description}",
         "ItemSetBonusGeneral": "套装奖励：{Description}",
         "ItemSetBonusDecidedByHead": "随头部装备改变",
         "ItemSetBonusDecidedByBody": "随躯干装备改变",
@@ -528,7 +528,7 @@
         "FromTerrariaModsDescription": "含有基于模组内容的资源包。",
         "PopularCulture": "流行文化",
         "PopularCultureDescription": "充满流行文化的资源包。",
-        "FunSilly": "有趣\/蠢萌",
+        "FunSilly": "有趣/蠢萌",
         "FunSillyDescription": "含有趣事和蠢事的资源包。你的弥母来了！",
         "Music": "音乐",
         "MusicDescription": "可调整泰拉瑞亚音乐的资源包，赋予新的氛围！",
@@ -642,7 +642,7 @@
         "NotEnoughWater": "水量不够！",
         "FullFishingPower": "{0}({1}%)点渔力",
         "PrecentFishingPower": "{0}%渔力",
-        "BaitRequired": "需要鱼饵才能抓鱼，每次收杆有1\/7概率断线",
+        "BaitRequired": "需要鱼饵才能抓鱼，每次收杆有1/7概率断线",
         "BaitPower": "{0}%鱼饵力",
         "HairStyle": "换发型",
         "CraftingWindow": "打开合成窗口",
